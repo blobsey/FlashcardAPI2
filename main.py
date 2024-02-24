@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, Header, Body, Depends, Path
 from datetime import datetime, timedelta
-from math import exp
+from math import exp, pow
 from mangum import Mangum
 import boto3
 import uuid
+from decimal import Decimal
 
 # Initialize the FastAPI app
 app = FastAPI()
@@ -13,6 +14,11 @@ dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 # Reference your DynamoDB tables
 api_keys_table = dynamodb.Table('flashcard_api_keys')
 flashcards_table = dynamodb.Table('flashcard_data')  
+# Math constants
+w = [0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0.34, 1.26, 0.29, 2.61]
+FACTOR = 19/81
+R = 0.9  # Desired retention rate
+DECAY = -0.5
 
 def fetch_user_id(x_api_key: str = Header(None)):
     if x_api_key is None:
@@ -81,7 +87,51 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
     # Can't review cards before review_date
     today = datetime.now().date()
     if 'review_date' in card and today < datetime.strptime(card['review_date'], '%Y-%m-%d').date():
-        raise HTTPException(status_code=403, detail="This card is not due for review yet.")
+        raise HTTPException(status_code=403, detail="This card is not due for review yet.") 
+
+        if grade not in [1, 2, 3, 4]:
+        raise ValueError("Grade must be between 1 and 4.")
+
+    ### FSRS v4.5 Logic below 
+    
+    # Helper function to calculate initial difficulty
+    def D0(G):
+        return w[4] - (G - 3) * w[5]
+
+    # Adapt difficulty calculation
+    difficulty = card.get('difficulty', None)
+    if difficulty is None:
+        difficulty = D0(grade)
+    else:
+        difficulty = (w[7] * D0(3) + (1 - w[7])) * (difficulty - w[6] * (grade - 3))
+    difficulty = max(1, min(difficulty, 10))  # Ensure difficulty is within bounds
+
+    # Stability calculations remain the same; just ensure we handle Decimal conversion if needed
+    stability = card.get('stability', None)
+    if stability is None:
+        stability = Decimal(w[grade - 1])
+    elif grade == 1:
+        stability = calculate_new_stability_on_fail(difficulty, stability)
+    else:
+        stability = calculate_new_stability_on_success(difficulty, stability, grade)
+
+    # Calculate next review date
+    I = (stability / FACTOR) * (pow(R, 1 / DECAY) - 1)
+    next_review_date = datetime.now().date() + timedelta(days=int(I))
+
+    # DynamoDB update operation
+    table.update_item(
+        Key={'user_id': user_id, 'card_id': card_id},
+        UpdateExpression="set difficulty = :d, stability = :s, review_date = :r, last_review_date = :l",
+        ExpressionAttributeValues={
+            ':d': Decimal(str(difficulty)),  # Convert to Decimal for DynamoDB
+            ':s': Decimal(str(stability)),
+            ':r': next_review_date.strftime('%Y-%m-%d'),
+            ':l': datetime.now().date().strftime('%Y-%m-%d')
+        },
+    )
+
+
 
 
 # Adapter for AWS Lambda
