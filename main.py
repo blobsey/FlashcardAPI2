@@ -90,30 +90,41 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
         raise HTTPException(status_code=403, detail="This card is not due for review yet.") 
 
         if grade not in [1, 2, 3, 4]:
-        raise ValueError("Grade must be between 1 and 4.")
+            raise ValueError("Grade must be between 1 and 4.")
 
-    ### FSRS v4.5 Logic below 
-    
+    ### FSRS v4.5 Logic below ###
+
     # Helper function to calculate initial difficulty
     def D0(G):
         return w[4] - (G - 3) * w[5]
 
-    # Adapt difficulty calculation
-    difficulty = card.get('difficulty', None)
-    if difficulty is None:
-        difficulty = D0(grade)
-    else:
-        difficulty = (w[7] * D0(3) + (1 - w[7])) * (difficulty - w[6] * (grade - 3))
-    difficulty = max(1, min(difficulty, 10))  # Ensure difficulty is within bounds
+    # Difficulty
+    difficulty = float(card.get('difficulty', D0(grade)))
 
-    # Stability calculations remain the same; just ensure we handle Decimal conversion if needed
-    stability = card.get('stability', None)
-    if stability is None:
-        stability = Decimal(w[grade - 1])
-    elif grade == 1:
-        stability = calculate_new_stability_on_fail(difficulty, stability)
-    else:
-        stability = calculate_new_stability_on_success(difficulty, stability, grade)
+    if 'difficulty' in card: # If this is a subsequent review
+        difficulty = (w[7] * D0(3) + (1 - w[7])) * (difficulty - w[6] * (grade - 3))
+        difficulty = max(1, min(difficulty, 10))  # Ensure difficulty is within bounds
+
+
+    # Stability
+    def calculate_new_stability_on_success(D, S, G):
+        inner_term = exp(w[8]) * (11 - D) * S**(-w[9]) * (exp(w[10] * (1 - R)) - 1)
+        if G == 2: # "Hard" multiplies by .29 
+            inner_term *= w[15]
+        elif G == 4: # "Easy" multiplies by 2.61
+            inner_term *= w[16]
+        return S * (inner_term + 1)
+
+    def calculate_new_stability_on_fail(D, S):
+        return w[11] * pow(D, (-w[12])) * (pow((S + 1), w[13]) - 1) * exp(w[14] * (1 - R))
+
+    stability = float(card.get('stability', w[grade - 1]))
+
+    if 'stability' in card: # If this is a subsequent review
+        if grade == 1: # Failure
+            stability = calculate_new_stability_on_fail(difficulty, stability)
+        else: # Success
+            stability = calculate_new_stability_on_success(difficulty, stability, grade)
 
     # Calculate next review date
     I = (stability / FACTOR) * (pow(R, 1 / DECAY) - 1)
