@@ -242,9 +242,6 @@ def clear_flashcards(user_id: str = Depends(fetch_user_id)):
     return {"message": "All flashcards cleared for the user."}
 
 
-
-app = FastAPI()
-
 # Helper function for /upload path to extract cards
 async def extract_anki2(file_path):
     # Connect to the Anki SQLite database
