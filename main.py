@@ -10,7 +10,7 @@ from boto3.dynamodb.conditions import Attr, Key
 from decimal import Decimal
 import shutil
 import os
-import sqlite3
+import pysqlite3 as sqlite3
 
 
 # Initialize the FastAPI app
@@ -137,17 +137,30 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
     I = (stability / FACTOR) * (pow(R, 1 / DECAY) - 1)
     next_review_date = datetime.now().date() + timedelta(days=int(I))
 
-    # DynamoDB update operation
-    table.update_item(
-        Key={'user_id': user_id, 'card_id': card_id},
-        UpdateExpression="set difficulty = :d, stability = :s, review_date = :r, last_review_date = :l",
-        ExpressionAttributeValues={
-            ':d': Decimal(str(difficulty)),  # Convert to Decimal for DynamoDB
-            ':s': Decimal(str(stability)),
-            ':r': next_review_date.strftime('%Y-%m-%d'),
-            ':l': datetime.now().date().strftime('%Y-%m-%d')
-        },
-    )
+    try:
+        table.update_item(
+            Key={'user_id': user_id, 'card_id': card_id},
+            UpdateExpression="set difficulty = :d, stability = :s, review_date = :r, last_review_date = :l",
+            ExpressionAttributeValues={
+                ':d': Decimal(str(difficulty)),
+                ':s': Decimal(str(stability)),
+                ':r': next_review_date.strftime('%Y-%m-%d'),
+                ':l': datetime.now().date().strftime('%Y-%m-%d')
+            },
+        )
+        # Construct and return a JSON response with the review details
+        return JSONResponse(content={
+            "message": "Review updated successfully",
+            "card_id": card_id,
+            "user_id": user_id,
+            "difficulty": difficulty,
+            "stability": stability,
+            "next_review_date": next_review_date.strftime('%Y-%m-%d'),
+            "last_review_date": datetime.now().date().strftime('%Y-%m-%d')
+        })
+    except Exception as e:
+        # Handle potential errors
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
 @app.get("/next")
@@ -270,7 +283,8 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
     if not file.filename.endswith('.anki2'):
         return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 file."})
 
-    tmp_file_path = f"/tmp/{uuid.uuid4()}.anki2"  # Use uuid just in case multiple people are uploading
+    tmp_file_path = f"/tmp/{uuid.uuid4()}.anki2"  # Use uuid in case multiple people uploading
+    
     with open(tmp_file_path, 'wb') as tmp_file:
         shutil.copyfileobj(file.file, tmp_file)
     
