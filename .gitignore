@@ -2,3 +2,4 @@ __pycache__/
 deployment/
 venv/
 devenv/
+deploy.log
