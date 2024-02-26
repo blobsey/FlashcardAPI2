@@ -11,16 +11,18 @@ from decimal import Decimal
 import shutil
 import os
 import pysqlite3 as sqlite3
+from pydantic import BaseModel, Field
 
-
-# Initialize the FastAPI app
+# FastAPI Boilerplate
 app = FastAPI()
 
-# Initialize a DynamoDB resource
+# Initialize DynamoDB 
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-# Reference your DynamoDB tables
 api_keys_table = dynamodb.Table('flashcard_api_keys')
-flashcards_table = dynamodb.Table('flashcard_data')  
+flashcards_table = dynamodb.Table('flashcard_data')
+histories_table = dynamodb.Table('flashcard_histories')
+users_table = dynamodb.Table('flashcard_users')
+
 # Math constants
 w = [0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0.34, 1.26, 0.29, 2.61]
 FACTOR = 19/81
@@ -40,8 +42,8 @@ def validate_api_key(user_id: str = Depends(fetch_user_id)):
     return {"message": "API Key is valid", "user_id": user_id}
 
 @app.post("/add")
-def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), user_id: str = Depends(fetch_user_id)):    # Generate a unique card_id
-    card_id = str(uuid.uuid4())
+def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), user_id: str = Depends(fetch_user_id)):
+    card_id = str(uuid.uuid4()) # Generate a unique card_id
     
     # Store the flashcard details
     try:
@@ -137,6 +139,8 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
     I = (stability / FACTOR) * (pow(R, 1 / DECAY) - 1)
     next_review_date = datetime.now().date() + timedelta(days=int(I))
 
+
+    # Update flashcard_data with results of review
     try:
         table.update_item(
             Key={'user_id': user_id, 'card_id': card_id},
@@ -148,45 +152,108 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
                 ':l': datetime.now().date().strftime('%Y-%m-%d')
             },
         )
-        # Construct and return a JSON response with the review details
-        return JSONResponse(content={
-            "message": "Review updated successfully",
-            "card_id": card_id,
-            "user_id": user_id,
-            "difficulty": difficulty,
-            "stability": stability,
-            "next_review_date": next_review_date.strftime('%Y-%m-%d'),
-            "last_review_date": datetime.now().date().strftime('%Y-%m-%d')
-        })
     except Exception as e:
         # Handle potential errors
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
+    # Update flashcard_histories
+    today_str = datetime.now().date().strftime('%Y-%m-%d')
+    try:
+        response = histories_table.update_item(
+            Key={
+                'user_id': user_id,
+                'date': today_str
+            },
+            UpdateExpression="SET all_reviews = if_not_exists(all_reviews, :start) + :inc, "
+                             "new_reviews = if_not_exists(new_reviews, :start) + :new_inc",
+            ExpressionAttributeValues={
+                ':inc': Decimal('1'),
+                ':new_inc': Decimal('0') if 'review_date' in card else Decimal('1'), # If it s a new card, increment new_reviews
+                ':start': Decimal('0')
+            },
+            ReturnValues="UPDATED_NEW"  # Returns the new values of the updated attributes
+        )
+        updated_values = response.get('Attributes', {})
+        new_reviews = updated_values.get('new_reviews', 0)
+        all_reviews = updated_values.get('all_reviews', 0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update flashcard history: {str(e)}")
+
+    # Return all the review details
+    return JSONResponse(content={
+        "message": "Review updated successfully",
+        "card_id": card_id,
+        "user_id": user_id,
+        "difficulty": difficulty,
+        "stability": stability,
+        "next_review_date": next_review_date.strftime('%Y-%m-%d'),
+        "last_review_date": datetime.now().date().strftime('%Y-%m-%d'),
+        "new_reviews": str(new_reviews),
+        "all_reviews": str(all_reviews)
+    })
+
+
 @app.get("/next")
 def get_next_card(user_id: str = Depends(fetch_user_id)):
-    dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-    table = dynamodb.Table('flashcard_data')  # Use your actual table name
+    today = datetime.now().date().strftime('%Y-%m-%d')
+    
+    try:
+        # Assuming users_table and histories_table are defined and accessible here
+        prefs = users_table.get_item(Key={'user_id': user_id}).get('Item', {})
+        max_new_cards = (prefs.get('max_new_cards', 30))  # Default to 30 if not set
+        
+        history = histories_table.get_item(Key={'date': today, 'user_id': user_id}).get('Item', {})
+        new_reviews_today = int(history.get('new_reviews', 0))  # Default to 0 if not set
+        new_cards_remaining = max(max_new_cards - new_reviews_today, 0)
 
-    today = date.today().isoformat()
+        # Initialize the list to hold all due cards
+        unfiltered_cards = []
 
-    # Scan for cards whose review date is today or in the past, including those without a review_date
-    response = table.scan(
-        FilterExpression=Attr('user_id').eq(user_id) & (Attr('review_date').lte(today) | Attr('review_date').not_exists())
-    )
+        # Start the query and pagination loop
+        response = flashcards_table.query(
+            KeyConditionExpression=Key('user_id').eq(user_id),
+            FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists()
+        )
+        unfiltered_cards.extend(response.get('Items', []))
 
-    due_cards = response.get('Items', [])
-    if not due_cards:
-        return {"message": "No cards to review right now."}
+        # Handle pagination if there are more items to fetch
+        while 'LastEvaluatedKey' in response:
+            response = flashcards_table.query(
+                KeyConditionExpression=Key('user_id').eq(user_id),
+                FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists(),
+                ExclusiveStartKey=response['LastEvaluatedKey']
+            )
+            unfiltered_cards.extend(response.get('Items', []))
 
-    # Filter cards with the earliest review date or no review date
-    earliest_date = min((card.get('review_date', today) for card in due_cards), default=today)
-    earliest_cards = [card for card in due_cards if card.get('review_date', today) == earliest_date]
+        # Filter to "new cards" and "review cards", pick one randomly
+        new_cards = [card for card in unfiltered_cards if 'review_date' not in card][:new_cards_remaining]
 
-    # Randomly select a card from the earliest review date (most overdue cards)
-    selected_card = random.choice(earliest_cards)
+        target_date = min([card.get('review_date', today) for card in unfiltered_cards])
+        review_cards = [card for card in unfiltered_cards if 'review_date' in card and card['review_date'] == target_date]
 
-    return selected_card
+        combined_subset = new_cards + review_cards
+
+        print("New cards remaining: " + str(new_cards_remaining))
+
+        print("New cards: ")
+        print(new_cards)
+
+        print("\n\nDue cards: ")
+        for card in review_cards:
+            print(card['card_id'] + " " + card.get('review_date', "none"))
+        
+        if combined_subset:
+            selected_card = random.choice(combined_subset)
+            return selected_card
+        else:
+            return {"message": "No cards to review right now."}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while fetching the next card.")
+
 
 @app.put("/edit/{card_id}")
 def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to edit"),
@@ -230,6 +297,7 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
 
     # Return the updated flashcard in the response
     return {"message": "Flashcard updated successfully!", "flashcard": updated_response['Item']}
+
 
 @app.delete("/clear")
 def clear_flashcards(user_id: str = Depends(fetch_user_id)):
@@ -283,7 +351,7 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
     if not file.filename.endswith('.anki2'):
         return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 file."})
 
-    tmp_file_path = f"/tmp/{uuid.uuid4()}.anki2"  # Use uuid in case multiple people uploading
+    tmp_file_path = f"/tmp/{uuid.uuid4()}.anki2" 
     
     with open(tmp_file_path, 'wb') as tmp_file:
         shutil.copyfileobj(file.file, tmp_file)
@@ -308,6 +376,53 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
             os.remove(tmp_file_path)
     
     return JSONResponse(content={"message": message})
+
+
+class UserPreferences(BaseModel):
+    max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=None)
+
+
+# Setting preferences
+@app.put("/preferences")
+def update_user_preferences(preferences: UserPreferences, user_id: str = Depends(fetch_user_id)):
+    # Dynamically build the update expression and attribute values
+    update_expression = "set "
+    expression_attribute_values = {}
+    for field, value in preferences.dict(exclude_none=True).items():
+        update_expression += f"{field} = :{field}, "
+        expression_attribute_values[f":{field}"] = value
+    
+    # Remove trailing comma and space from the update expression
+    update_expression = update_expression.rstrip(", ")
+
+    # Update in flashcard_userprefs table
+    try:
+        response = users_table.update_item(
+            Key={'user_id': user_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_attribute_values,
+            ReturnValues="UPDATED_NEW"
+        )
+        return {"message": "Preferences updated successfully", "updatedAttributes": response.get('Attributes')}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update preferences: {str(e)}")
+
+
+# Fetch preferences
+@app.get("/preferences")
+def get_user_preferences(user_id: str = Depends(fetch_user_id)):
+    try:
+        response = users_table.get_item(Key={'user_id': user_id})
+        if 'Item' not in response:
+            # If no preferences are found, you might want to return default preferences or indicate that preferences are not set.
+            return JSONResponse(status_code=404, content={"message": "User preferences not found."})
+        # Return the found preferences, excluding the user_id from the response.
+        preferences = response['Item']
+        preferences.pop('user_id', None)  # Optional: Remove the user_id from the response if present.
+        return preferences
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch user preferences: {str(e)}")
+
 
 
 # Adapter for AWS Lambda
