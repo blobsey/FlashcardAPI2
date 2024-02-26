@@ -233,15 +233,6 @@ def get_next_card(user_id: str = Depends(fetch_user_id)):
         review_cards = [card for card in unfiltered_cards if 'review_date' in card and card['review_date'] == target_date]
 
         combined_subset = new_cards + review_cards
-
-        print("New cards remaining: " + str(new_cards_remaining))
-
-        print("New cards: ")
-        print(new_cards)
-
-        print("\n\nDue cards: ")
-        for card in review_cards:
-            print(card['card_id'] + " " + card.get('review_date', "none"))
         
         if combined_subset:
             selected_card = random.choice(combined_subset)
