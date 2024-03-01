@@ -229,9 +229,11 @@ def get_next_card(user_id: str = Depends(fetch_user_id)):
         # Filter to "new cards" and "review cards", pick one randomly
         new_cards = [card for card in unfiltered_cards if 'review_date' not in card][:new_cards_remaining]
 
-        target_date = min([card.get('review_date', today) for card in unfiltered_cards])
-        review_cards = [card for card in unfiltered_cards if 'review_date' in card and card['review_date'] == target_date]
-
+        # Find the cards with earliest review date (most overdue cards)
+        review_dates = [card['review_date'] for card in unfiltered_cards if 'review_date' in card]
+        target_date = min(review_dates) if review_dates else None
+        review_cards = [card for card in unfiltered_cards if card.get('review_date') == target_date] if target_date else []
+        
         combined_subset = new_cards + review_cards
         
         if combined_subset:
