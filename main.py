@@ -238,7 +238,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id)):
         
         if combined_subset:
             selected_card = random.choice(combined_subset)
-            return selected_card
+            return { "flashcard": selected_card }
         else:
             return {"message": "No cards to review right now."}
     except HTTPException as http_exc:
