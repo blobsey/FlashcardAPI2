@@ -94,12 +94,12 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
     card = response['Item']
 
     # Can't review cards before review_date
-    today = datetime.now().date()
+    today = datetime.utcnow().date()
     if 'review_date' in card and today < datetime.strptime(card['review_date'], '%Y-%m-%d').date():
-        raise HTTPException(status_code=403, detail="This card is not due for review yet.") 
+        raise HTTPException(status_code=403, detail=f"Card {card_id} is not due for review yet.") 
 
-        if grade not in [1, 2, 3, 4]:
-            raise ValueError("Grade must be between 1 and 4.")
+    if grade not in [1, 2, 3, 4]:
+        raise ValueError("Grade must be between 1 and 4.")
 
     ### FSRS v4.5 Logic below ###
 
@@ -137,7 +137,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
     # Calculate next review date
     I = (stability / FACTOR) * (pow(R, 1 / DECAY) - 1)
-    next_review_date = datetime.now().date() + timedelta(days=int(I))
+    next_review_date = datetime.utcnow().date() + timedelta(days=int(I))
 
 
     # Update flashcard_data with results of review
@@ -149,7 +149,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
                 ':d': Decimal(str(difficulty)),
                 ':s': Decimal(str(stability)),
                 ':r': next_review_date.strftime('%Y-%m-%d'),
-                ':l': datetime.now().date().strftime('%Y-%m-%d')
+                ':l': datetime.utcnow().date().strftime('%Y-%m-%d')
             },
         )
     except Exception as e:
@@ -158,7 +158,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
 
     # Update flashcard_histories
-    today_str = datetime.now().date().strftime('%Y-%m-%d')
+    today_str = datetime.utcnow().date().strftime('%Y-%m-%d')
     try:
         response = histories_table.update_item(
             Key={
@@ -188,7 +188,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
         "difficulty": difficulty,
         "stability": stability,
         "next_review_date": next_review_date.strftime('%Y-%m-%d'),
-        "last_review_date": datetime.now().date().strftime('%Y-%m-%d'),
+        "last_review_date": datetime.utcnow().date().strftime('%Y-%m-%d'),
         "new_reviews": str(new_reviews),
         "all_reviews": str(all_reviews)
     })
@@ -196,7 +196,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
 @app.get("/next")
 def get_next_card(user_id: str = Depends(fetch_user_id)):
-    today = datetime.now().date().strftime('%Y-%m-%d')
+    today = datetime.utcnow().date().strftime('%Y-%m-%d')
     
     try:
         # Assuming users_table and histories_table are defined and accessible here
