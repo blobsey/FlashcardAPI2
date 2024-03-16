@@ -292,6 +292,37 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
     return {"message": "Flashcard updated successfully!", "flashcard": updated_response['Item']}
 
 
+@app.get("/list")
+def list_flashcards(user_id: str = Depends(fetch_user_id)):
+    try:
+        flashcards = []
+
+        # Start the query and pagination loop
+        response = flashcards_table.query(
+            KeyConditionExpression=Key('user_id').eq(user_id)
+        )
+        flashcards.extend(response.get('Items', []))
+
+        # Handle pagination if there are more items to fetch
+        while 'LastEvaluatedKey' in response:
+            response = flashcards_table.query(
+                KeyConditionExpression=Key('user_id').eq(user_id),
+                ExclusiveStartKey=response['LastEvaluatedKey']
+            )
+            flashcards.extend(response.get('Items', []))
+
+        if flashcards:
+            return {"flashcards": flashcards}
+        else:
+            return {"message": "No flashcards found."}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while listing the flashcards.")
+
+
+
 @app.delete("/clear")
 def clear_flashcards(user_id: str = Depends(fetch_user_id)):
     # Scan DynamoDB to find all flashcards for the user
