@@ -30,7 +30,7 @@ R = 0.9  # Desired retention rate
 DECAY = -0.5
 
 def fetch_user_id(x_api_key: str = Header(None)):
-    if x_api_key is None:
+    if not x_api_key:
         raise HTTPException(status_code=400, detail="API key is required")
     response = api_keys_table.get_item(Key={'api_key': x_api_key})
     if 'Item' not in response:
