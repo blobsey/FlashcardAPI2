@@ -78,8 +78,12 @@ async def auth(request: Request):
 
 @app.route('/logout')
 async def logout(request: Request):
-    request.session.pop('user', None)
-    return HTMLResponse('<p>Logout successful.</p>')
+    try:
+        request.session.pop('user', None)
+        return JSONResponse(content={"message": "Logout successful."}, status_code=200)
+    except Exception as e:
+        return JSONResponse(content={"message": f"Logout failed: {str(e)}"}, status_code=500)
+
 
 def fetch_user_id(request: Request):
     user = request.session.get('user')
