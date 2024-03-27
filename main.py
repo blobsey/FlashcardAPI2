@@ -73,13 +73,6 @@ async def auth(request: Request):
     # Return an HTML response with a script to close the window
     return HTMLResponse('''
         <p>Login successful. You can now close this window or it will close automatically.</p>
-        <script>
-            window.onload = function() {
-                setTimeout(function() {
-                    window.close();
-                }, 5000);
-            };
-        </script>
     ''')
 
 
