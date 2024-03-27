@@ -45,7 +45,10 @@ oauth = OAuth(starlette_config)
 oauth.register(
     name='google',
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-    client_kwargs={'scope': 'openid email profile'},
+    client_kwargs={
+        'scope': 'openid email profile',
+        'prompt': 'select_account'
+        },
 )
 
 # Math constants
