@@ -100,7 +100,7 @@ def fetch_user_id(request: Request):
     return user_id
 
 @app.get("/validate-authentication")
-def validate_authorization(user_id: str = Depends(fetch_user_id)):
+def validate_authentication(user_id: str = Depends(fetch_user_id)):
     return {"message": "Authentication valid", "user_id": user_id}
 
 
