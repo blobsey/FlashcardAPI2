@@ -3,3 +3,7 @@ mangum==0.17.0
 python-multipart==0.0.9
 fastapi==0.110.0
 pysqlite3-binary==0.5.2.post3
+itsdangerous==2.1.2
+Authlib==1.3.0
+starlette-session==0.4.3
+httpx==0.27.0

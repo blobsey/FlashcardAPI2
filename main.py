@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Body, Depends, Path, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Header, Body, Depends, Path, File, UploadFile
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta, date
 from math import exp, pow
@@ -12,16 +12,41 @@ import shutil
 import os
 import pysqlite3 as sqlite3
 from pydantic import BaseModel, Field
+from starlette.config import Config
+from authlib.integrations.starlette_client import OAuth
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import RedirectResponse, HTMLResponse
+from authlib.integrations.starlette_client import OAuthError
+
+
+# Environment variables
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID') or None
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET') or None
+SECRET_KEY = os.environ.get('SECRET_KEY') or None
 
 # FastAPI Boilerplate
 app = FastAPI()
 
+# Configure SessionMiddleware for OAuth
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+
 # Initialize DynamoDB 
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-api_keys_table = dynamodb.Table('flashcard_api_keys')
 flashcards_table = dynamodb.Table('flashcard_data')
 histories_table = dynamodb.Table('flashcard_histories')
 users_table = dynamodb.Table('flashcard_users')
+
+if GOOGLE_CLIENT_ID is None or GOOGLE_CLIENT_SECRET is None:
+    raise BaseException('Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in env vars')
+
+config_data = {'GOOGLE_CLIENT_ID': GOOGLE_CLIENT_ID, 'GOOGLE_CLIENT_SECRET': GOOGLE_CLIENT_SECRET}
+starlette_config = Config(environ=config_data)
+oauth = OAuth(starlette_config)
+oauth.register(
+    name='google',
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'},
+)
 
 # Math constants
 w = [0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0.34, 1.26, 0.29, 2.61]
@@ -29,17 +54,55 @@ FACTOR = 19/81
 R = 0.9  # Desired retention rate
 DECAY = -0.5
 
-def fetch_user_id(x_api_key: str = Header(None)):
-    if not x_api_key:
-        raise HTTPException(status_code=400, detail="API key is required")
-    response = api_keys_table.get_item(Key={'api_key': x_api_key})
-    if 'Item' not in response:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    return response['Item']['user_id']  # Assuming 'user_id' is a field in the item
+@app.route('/login')
+async def login(request: Request):
+    redirect_uri = request.url_for('auth')  # This creates the url for the /auth endpoint
+    return await oauth.google.authorize_redirect(request, redirect_uri)
 
-@app.get("/validate-api-key")
-def validate_api_key(user_id: str = Depends(fetch_user_id)):
-    return {"message": "API Key is valid", "user_id": user_id}
+
+@app.route('/auth')
+async def auth(request: Request):
+    try:
+        token = await oauth.google.authorize_access_token(request)
+    except OAuthError as e:
+        return HTMLResponse(f'<p>Login unsuccessful: {str(e)} </p>')
+    
+    user_data = await oauth.google.userinfo(token=token)
+    request.session['user'] = dict(user_data)
+    
+    # Return an HTML response with a script to close the window
+    return HTMLResponse('''
+        <p>Login successful. You can now close this window or it will close automatically.</p>
+        <script>
+            window.onload = function() {
+                setTimeout(function() {
+                    window.close();
+                }, 5000);
+            };
+        </script>
+    ''')
+
+
+@app.route('/logout')
+async def logout(request: Request):
+    request.session.pop('user', None)
+    return HTMLResponse('<p>Logout successful.</p>')
+
+def fetch_user_id(request: Request):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    user_id = user.get('sub')
+    if not user_id:
+        raise HTTPException(status_code=500, detail="User ID not found. Something's wrong with OAuth.")
+    
+    return user_id
+
+@app.get("/validate-authorization")
+def validate_authorization(user_id: str = Depends(fetch_user_id)):
+    return {"message": "Authorization valid", "user_id": user_id}
+
 
 @app.post("/add")
 def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), user_id: str = Depends(fetch_user_id)):
