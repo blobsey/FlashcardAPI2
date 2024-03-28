@@ -88,6 +88,14 @@ async def logout(request: Request):
         return JSONResponse(content={"message": f"Logout failed: {str(e)}"}, status_code=500)
 
 
+@app.get('/user-info')
+async def user_info(request: Request):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+    return user
+
+
 def fetch_user_id(request: Request):
     user = request.session.get('user')
     if not user:
@@ -98,6 +106,7 @@ def fetch_user_id(request: Request):
         raise HTTPException(status_code=500, detail="User ID not found. Something's wrong with OAuth.")
     
     return user_id
+
 
 @app.get("/validate-authentication")
 def validate_authentication(user_id: str = Depends(fetch_user_id)):
