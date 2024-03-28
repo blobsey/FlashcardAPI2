@@ -23,6 +23,7 @@ from authlib.integrations.starlette_client import OAuthError
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID') or None
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET') or None
 SECRET_KEY = os.environ.get('SECRET_KEY') or None
+EMAIL_ALLOWLIST = os.environ.get('EMAIL_ALLOWLIST', '').split(',') # Will be default to []
 
 # FastAPI Boilerplate
 app = FastAPI()
@@ -72,6 +73,16 @@ async def auth(request: Request):
     
     user_data = await oauth.google.userinfo(token=token)
     request.session['user'] = dict(user_data)
+
+    # Fetch user email
+    user_email = user_data.get('email')
+    print("user email: ", user_email)
+    
+    # Check if the user's email is in the EMAIL_ALLOWLIST
+    if user_email is None or user_email not in EMAIL_ALLOWLIST:
+        await logout(request)
+        return HTMLResponse(f'<p>Login unsuccessful: {user_email} is not authorized to access this application.</p>', status_code=403)
+    
     
     # Return an HTML response with a script to close the window
     return HTMLResponse('''
