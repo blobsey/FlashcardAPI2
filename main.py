@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Header, Body, Depends, Path, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Header, Body, Depends, Path, File, UploadFile, Query
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta, date
 from math import exp, pow
@@ -23,7 +23,7 @@ from authlib.integrations.starlette_client import OAuthError
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID') or None
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET') or None
 SECRET_KEY = os.environ.get('SECRET_KEY') or None
-EMAIL_ALLOWLIST = os.environ.get('EMAIL_ALLOWLIST', '').split(',') # Will be default to []
+EMAIL_ALLOWLIST = os.environ.get('EMAIL_ALLOWLIST', '').split(',') # Will default to []
 
 # FastAPI Boilerplate
 app = FastAPI()
@@ -99,8 +99,8 @@ async def logout(request: Request):
         return JSONResponse(content={"message": f"Logout failed: {str(e)}"}, status_code=500)
 
 
-@app.get('/user-info')
-async def user_info(request: Request):
+@app.get('/auth-info')
+async def auth_info(request: Request):
     user = request.session.get('user')
     if not user:
         raise HTTPException(status_code=401, detail="User not authenticated")
@@ -118,6 +118,11 @@ def fetch_user_id(request: Request):
     
     return user_id
 
+# Helper function; returns the specified deck if provided
+# otherwise use the user's current deck preference or "default"
+def get_deck(deck: str = Query(None), user_id: str = Depends(fetch_user_id)):
+    return deck or users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', 'default')
+
 
 @app.get("/validate-authentication")
 def validate_authentication(user_id: str = Depends(fetch_user_id)):
@@ -125,8 +130,9 @@ def validate_authentication(user_id: str = Depends(fetch_user_id)):
 
 
 @app.post("/add")
-def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), user_id: str = Depends(fetch_user_id)):
-    card_id = str(uuid.uuid4()) # Generate a unique card_id
+def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), deck: str = Depends(get_deck), user_id: str = Depends(fetch_user_id)):
+    
+    card_id = f"{deck}-{str(uuid.uuid4())}" # Generate card_id with deck and unique identifier
     
     # Store the flashcard details
     try:
@@ -278,13 +284,14 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
 
 @app.get("/next")
-def get_next_card(user_id: str = Depends(fetch_user_id)):
+def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
     today = datetime.utcnow().date().strftime('%Y-%m-%d')
     
     try:
-        # Assuming users_table and histories_table are defined and accessible here
+        # Fetch user's preferred max_new_cards and deck
         prefs = users_table.get_item(Key={'user_id': user_id}).get('Item', {})
         max_new_cards = (prefs.get('max_new_cards', 30))  # Default to 30 if not set
+        deck = deck if deck else prefs.get('deck', 'default') # Default to 'default' if not set
         
         history = histories_table.get_item(Key={'date': today, 'user_id': user_id}).get('Item', {})
         new_reviews_today = int(history.get('new_reviews', 0))  # Default to 0 if not set
@@ -295,7 +302,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id)):
 
         # Start the query and pagination loop
         response = flashcards_table.query(
-            KeyConditionExpression=Key('user_id').eq(user_id),
+            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-"),
             FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists()
         )
         unfiltered_cards.extend(response.get('Items', []))
@@ -303,7 +310,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id)):
         # Handle pagination if there are more items to fetch
         while 'LastEvaluatedKey' in response:
             response = flashcards_table.query(
-                KeyConditionExpression=Key('user_id').eq(user_id),
+                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-"),
                 FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists(),
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
@@ -376,8 +383,10 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
 
 
 @app.get("/list")
-def list_flashcards(user_id: str = Depends(fetch_user_id)):
+def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
     try:
+        # If deck is not specified, fetch user's preferred deck
+        deck = deck if deck else users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', 'default') # Default to 'default' if not set
         flashcards = []
 
         # Start the query and pagination loop
@@ -454,7 +463,7 @@ async def extract_anki2(file_path):
     return cards
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id)):
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
     if not file.filename.endswith('.anki2'):
         return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 file."})
 
@@ -470,7 +479,7 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
             for card in extracted_cards:
                 batch.put_item(Item={
                     'user_id': user_id,
-                    'card_id': str(uuid.uuid4()),  # Generate a unique ID for each card
+                    'card_id': f"{deck}-{str(uuid.uuid4())}",  # Generate a unique ID for each card
                     'card_front': card['card_front'],
                     'card_back': card['card_back'],
                 })
@@ -484,25 +493,28 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
     
     return JSONResponse(content={"message": message})
 
-
-class UserPreferences(BaseModel):
+# To add/remove preferences, specify in UserPreferences class
+# They will get picked up dynamically by the PUT and GET /preferences paths
+class UserData(BaseModel):
     max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=None)
+    deck: str = Field(default="default", description="Deck used for /next, /add, /list, /upload if otherwise unspecified")
+
 
 
 # Setting preferences
-@app.put("/preferences")
-def update_user_preferences(preferences: UserPreferences, user_id: str = Depends(fetch_user_id)):
+@app.put("/user-data")
+def update_userdata(user_data: UserData, user_id: str = Depends(fetch_user_id)):
     # Dynamically build the update expression and attribute values
     update_expression = "set "
     expression_attribute_values = {}
-    for field, value in preferences.dict(exclude_none=True).items():
+    for field, value in user_data.dict(exclude_none=True).items():
         update_expression += f"{field} = :{field}, "
         expression_attribute_values[f":{field}"] = value
     
     # Remove trailing comma and space from the update expression
     update_expression = update_expression.rstrip(", ")
 
-    # Update in flashcard_userprefs table
+    # Update in users_table
     try:
         response = users_table.update_item(
             Key={'user_id': user_id},
@@ -510,25 +522,25 @@ def update_user_preferences(preferences: UserPreferences, user_id: str = Depends
             ExpressionAttributeValues=expression_attribute_values,
             ReturnValues="UPDATED_NEW"
         )
-        return {"message": "Preferences updated successfully", "updatedAttributes": response.get('Attributes')}
+        return {"message": "User data updated successfully", "updatedAttributes": response.get('Attributes')}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update preferences: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
 
 
 # Fetch preferences
-@app.get("/preferences")
-def get_user_preferences(user_id: str = Depends(fetch_user_id)):
+@app.get("/user-data")
+def get_userdata(user_id: str = Depends(fetch_user_id)):
     try:
         response = users_table.get_item(Key={'user_id': user_id})
         if 'Item' not in response:
-            # If no preferences are found, you might want to return default preferences or indicate that preferences are not set.
             return JSONResponse(status_code=404, content={"message": "User preferences not found."})
+
         # Return the found preferences, excluding the user_id from the response.
-        preferences = response['Item']
-        preferences.pop('user_id', None)  # Optional: Remove the user_id from the response if present.
-        return preferences
+        user_data = response['Item']
+        user_data.pop('user_id', None) 
+        return user_data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch user preferences: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch user data: {str(e)}")
 
 
 
