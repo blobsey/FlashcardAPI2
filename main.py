@@ -11,12 +11,13 @@ from decimal import Decimal
 import shutil
 import os
 import pysqlite3 as sqlite3
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, constr
 from starlette.config import Config
 from authlib.integrations.starlette_client import OAuth
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import RedirectResponse, HTMLResponse
 from authlib.integrations.starlette_client import OAuthError
+from typing import List
 
 
 # Environment variables
@@ -493,15 +494,14 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
     
     return JSONResponse(content={"message": message})
 
-# To add/remove preferences, specify in UserPreferences class
-# They will get picked up dynamically by the PUT and GET /preferences paths
+# To add/remove fields, specify in UserData class
+# They will get picked up dynamically by the PUT and GET /user-data paths
 class UserData(BaseModel):
     max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=None)
     deck: str = Field(default="default", description="Deck used for /next, /add, /list, /upload if otherwise unspecified")
+    decks: List[constr(strip_whitespace=True, min_length=1)] = Field(default=[], description="List of user's decks")
 
-
-
-# Setting preferences
+# Setting userdata
 @app.put("/user-data")
 def update_userdata(user_data: UserData, user_id: str = Depends(fetch_user_id)):
     # Dynamically build the update expression and attribute values
