@@ -77,7 +77,6 @@ async def auth(request: Request):
 
     # Fetch user email
     user_email = user_data.get('email')
-    print("user email: ", user_email)
     
     # Check if the user's email is in the EMAIL_ALLOWLIST
     if user_email is None or user_email not in EMAIL_ALLOWLIST:
@@ -291,7 +290,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
     try:
         # Fetch user's preferred max_new_cards and deck
         prefs = users_table.get_item(Key={'user_id': user_id}).get('Item', {})
-        max_new_cards = (prefs.get('max_new_cards', 30))  # Default to 30 if not set
+        max_new_cards = int(prefs.get('max_new_cards', 30))  # Default to 30 if not set
         deck = deck if deck else prefs.get('deck', 'default') # Default to 'default' if not set
         
         history = histories_table.get_item(Key={'date': today, 'user_id': user_id}).get('Item', {})
@@ -392,14 +391,14 @@ def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(g
 
         # Start the query and pagination loop
         response = flashcards_table.query(
-            KeyConditionExpression=Key('user_id').eq(user_id)
+            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-")
         )
         flashcards.extend(response.get('Items', []))
 
         # Handle pagination if there are more items to fetch
         while 'LastEvaluatedKey' in response:
             response = flashcards_table.query(
-                KeyConditionExpression=Key('user_id').eq(user_id),
+                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-"),
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
             flashcards.extend(response.get('Items', []))
@@ -497,20 +496,26 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
 # To add/remove fields, specify in UserData class
 # They will get picked up dynamically by the PUT and GET /user-data paths
 class UserData(BaseModel):
-    max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=None)
+    max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=30)
     deck: str = Field(default="default", description="Deck used for /next, /add, /list, /upload if otherwise unspecified")
-    decks: List[constr(strip_whitespace=True, min_length=1)] = Field(default=[], description="List of user's decks")
+    decks: List[constr(strip_whitespace=True, min_length=1)] = Field(default=["default"], description="List of user's decks")
 
 # Setting userdata
 @app.put("/user-data")
 def update_userdata(user_data: UserData, user_id: str = Depends(fetch_user_id)):
+    # Create a dictionary with only the fields that are explicitly provided in the request payload
+    update_data = user_data.dict(exclude_unset=True)
+
+    if not update_data:
+        return {"message": "No fields to update"}
+
     # Dynamically build the update expression and attribute values
     update_expression = "set "
     expression_attribute_values = {}
-    for field, value in user_data.dict(exclude_none=True).items():
+    for field, value in update_data.items():
         update_expression += f"{field} = :{field}, "
         expression_attribute_values[f":{field}"] = value
-    
+
     # Remove trailing comma and space from the update expression
     update_expression = update_expression.rstrip(", ")
 
@@ -531,14 +536,13 @@ def update_userdata(user_data: UserData, user_id: str = Depends(fetch_user_id)):
 @app.get("/user-data")
 def get_userdata(user_id: str = Depends(fetch_user_id)):
     try:
+        # Return userdata, providing default values where missing
         response = users_table.get_item(Key={'user_id': user_id})
-        if 'Item' not in response:
-            return JSONResponse(status_code=404, content={"message": "User preferences not found."})
+        user_data = response.get('Item', {})  # Use get() to avoid KeyError
 
-        # Return the found preferences, excluding the user_id from the response.
-        user_data = response['Item']
-        user_data.pop('user_id', None) 
-        return user_data
+        user_data.pop('user_id', None) # Remove redundant user_id
+        merged_user_data = UserData.parse_obj(user_data)
+        return {"data": merged_user_data.dict()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch user data: {str(e)}")
 
