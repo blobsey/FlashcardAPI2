@@ -18,6 +18,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import RedirectResponse, HTMLResponse
 from authlib.integrations.starlette_client import OAuthError
 from typing import List
+import hashlib
+
 
 
 # Environment variables
@@ -124,6 +126,10 @@ def get_deck(deck: str = Query(None), user_id: str = Depends(fetch_user_id)):
     return deck or users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', 'default')
 
 
+def sha256_hash(s):
+    return hashlib.sha256(s.encode('utf-8', errors='replace')).hexdigest()
+
+
 @app.get("/validate-authentication")
 def validate_authentication(user_id: str = Depends(fetch_user_id)):
     return {"message": "Authentication valid", "user_id": user_id}
@@ -132,7 +138,7 @@ def validate_authentication(user_id: str = Depends(fetch_user_id)):
 @app.post("/add")
 def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), deck: str = Depends(get_deck), user_id: str = Depends(fetch_user_id)):
     
-    card_id = f"{deck}-{str(uuid.uuid4())}" # Generate card_id with deck and unique identifier
+    card_id = f"{sha256_hash(deck)}-{str(uuid.uuid4())}" # Generate card_id with deck and unique identifier
     
     # Store the flashcard details
     try:
@@ -291,7 +297,6 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
         # Fetch user's preferred max_new_cards and deck
         prefs = users_table.get_item(Key={'user_id': user_id}).get('Item', {})
         max_new_cards = int(prefs.get('max_new_cards', 30))  # Default to 30 if not set
-        deck = deck if deck else prefs.get('deck', 'default') # Default to 'default' if not set
         
         history = histories_table.get_item(Key={'date': today, 'user_id': user_id}).get('Item', {})
         new_reviews_today = int(history.get('new_reviews', 0))  # Default to 0 if not set
@@ -302,7 +307,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
 
         # Start the query and pagination loop
         response = flashcards_table.query(
-            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-"),
+            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-"),
             FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists()
         )
         unfiltered_cards.extend(response.get('Items', []))
@@ -310,7 +315,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
         # Handle pagination if there are more items to fetch
         while 'LastEvaluatedKey' in response:
             response = flashcards_table.query(
-                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-"),
+                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-"),
                 FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists(),
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
@@ -385,20 +390,18 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
 @app.get("/list")
 def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
     try:
-        # If deck is not specified, fetch user's preferred deck
-        deck = deck if deck else users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', 'default') # Default to 'default' if not set
         flashcards = []
 
         # Start the query and pagination loop
         response = flashcards_table.query(
-            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-")
+            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-")
         )
         flashcards.extend(response.get('Items', []))
 
         # Handle pagination if there are more items to fetch
         while 'LastEvaluatedKey' in response:
             response = flashcards_table.query(
-                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{deck}-"),
+                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-"),
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
             flashcards.extend(response.get('Items', []))
@@ -414,17 +417,14 @@ def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(g
         raise HTTPException(status_code=500, detail="An unexpected error occurred while listing the flashcards.")
 
 
-
-@app.delete("/clear")
-def clear_flashcards(user_id: str = Depends(fetch_user_id)):
-    # Scan DynamoDB to find all flashcards for the user
+@app.delete("/delete-deck/{deck}")
+def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), user_id: str = Depends(fetch_user_id)):
+    # Scan DynamoDB to find all flashcards for the user and the specified deck
     response = flashcards_table.scan(
-        FilterExpression=Attr('user_id').eq(user_id)
+        FilterExpression=Attr('user_id').eq(user_id) & Attr('card_id').begins_with(f"{sha256_hash(deck)}-")
     )
 
     flashcards = response.get('Items', [])
-    if not flashcards:
-        return {"message": "No flashcards found for the user."}
 
     # Delete each flashcard
     with flashcards_table.batch_writer() as batch:
@@ -436,7 +436,81 @@ def clear_flashcards(user_id: str = Depends(fetch_user_id)):
                 }
             )
 
-    return {"message": "All flashcards cleared for the user."}
+    # Remove the deck from the user's list of decks
+    try:
+        users_table.update_item(
+            Key={'user_id': user_id},
+            UpdateExpression="REMOVE decks[" + str(users_table.get_item(Key={'user_id': user_id})['Item']['decks'].index(deck)) + "]",
+            ConditionExpression="contains(decks, :deck)",
+            ExpressionAttributeValues={':deck': deck}
+        )
+    except Exception as e:
+        if 'ConditionalCheckFailedException' in str(e):
+            return {"message": f"Deck '{deck}' not found in user's list of decks."}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+
+    return {"message": f"Deck '{deck}' and associated cards deleted successfully."}
+
+
+@app.put("/rename-deck")
+def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str = Body(..., embed=True), user_id: str = Depends(fetch_user_id)):
+    old_hashed_deck = sha256_hash(old_deck_name)
+    new_hashed_deck = sha256_hash(new_deck_name)
+
+    # Scan the table to retrieve all cards for the user and the specified old deck
+    response = flashcards_table.scan(
+        FilterExpression=Attr('user_id').eq(user_id) & Attr('card_id').begins_with(f"{old_hashed_deck}-")
+    )
+    cards = response.get('Items', [])
+
+    # Batch write requests
+    with flashcards_table.batch_writer() as batch:
+        for card in cards:
+            old_card_id = card['card_id']
+            new_card_id = f"{new_hashed_deck}-" + old_card_id.split("-", 1)[1]
+
+            # Create a new item with the updated card_id
+            new_card = card.copy()
+            new_card['card_id'] = new_card_id
+            batch.put_item(Item=new_card)
+
+            # Delete the old item
+            batch.delete_item(Key={'user_id': user_id, 'card_id': old_card_id})
+
+    # Update the user's list of decks
+    try:
+        users_table.update_item(
+            Key={'user_id': user_id},
+            UpdateExpression="SET decks = :new_decks",
+            ConditionExpression="contains(decks, :old_deck_name)",
+            ExpressionAttributeValues={
+                ':old_deck_name': old_deck_name,
+                ':new_decks': [new_deck_name if deck == old_deck_name else deck for deck in users_table.get_item(Key={'user_id': user_id})['Item']['decks']]
+            }
+        )
+    except Exception as e:
+        if 'ConditionalCheckFailedException' in str(e):
+            raise HTTPException(status_code=404, detail=f"Deck '{old_deck_name}' not found in user's list of decks.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+
+    # Update the user's active deck if it matches the old deck name
+    try:
+        user_data = users_table.get_item(Key={'user_id': user_id})['Item']
+        if user_data.get('deck') == old_deck_name:
+            users_table.update_item(
+                Key={'user_id': user_id},
+                UpdateExpression="SET deck = :new_deck_name",
+                ExpressionAttributeValues={
+                    ':new_deck_name': new_deck_name
+                }
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update user's active deck: {str(e)}")
+
+
+    return {"message": f"Deck '{old_deck_name}' renamed to '{new_deck_name}' successfully."}
 
 
 # Helper function for /upload path to extract cards
@@ -479,7 +553,7 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
             for card in extracted_cards:
                 batch.put_item(Item={
                     'user_id': user_id,
-                    'card_id': f"{deck}-{str(uuid.uuid4())}",  # Generate a unique ID for each card
+                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",  # Generate a unique ID for each card
                     'card_front': card['card_front'],
                     'card_back': card['card_back'],
                 })
