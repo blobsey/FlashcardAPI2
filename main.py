@@ -17,7 +17,7 @@ from authlib.integrations.starlette_client import OAuth
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import RedirectResponse, HTMLResponse
 from authlib.integrations.starlette_client import OAuthError
-from typing import List
+from typing import List, Optional
 import hashlib
 
 
@@ -120,10 +120,12 @@ def fetch_user_id(request: Request):
     
     return user_id
 
-# Helper function; returns the specified deck if provided
-# otherwise use the user's current deck preference or "default"
+# Returns the specified deck if provided, or the user's active deck, or throw exception
 def get_deck(deck: str = Query(None), user_id: str = Depends(fetch_user_id)):
-    return deck or users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', 'default')
+    fetched_deck = deck or users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', None) 
+    if fetched_deck is None:
+        raise HTTPException(status_code=400, detail="No active deck found, please select one.")
+    return fetched_deck
 
 
 def sha256_hash(s):
@@ -436,19 +438,21 @@ def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), u
                 }
             )
 
+    # Get the user's current data
+    user_data = get_userdata(user_id)
+
     # Remove the deck from the user's list of decks
+    updated_decks = [d for d in user_data['data']['decks'] if d != deck]
+
+    # Update the user's data with the new list of decks
+    update_data = {'decks': updated_decks}
+    if user_data['data']['deck'] == deck:
+        update_data['deck'] = None
+
     try:
-        users_table.update_item(
-            Key={'user_id': user_id},
-            UpdateExpression="REMOVE decks[" + str(users_table.get_item(Key={'user_id': user_id})['Item']['decks'].index(deck)) + "]",
-            ConditionExpression="contains(decks, :deck)",
-            ExpressionAttributeValues={':deck': deck}
-        )
+        update_userdata(UserData(**update_data), user_id)
     except Exception as e:
-        if 'ConditionalCheckFailedException' in str(e):
-            return {"message": f"Deck '{deck}' not found in user's list of decks."}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
 
     return {"message": f"Deck '{deck}' and associated cards deleted successfully."}
 
@@ -478,37 +482,25 @@ def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str =
             # Delete the old item
             batch.delete_item(Key={'user_id': user_id, 'card_id': old_card_id})
 
+    # Get the user's current data
+    user_data = get_userdata(user_id)
+
+    # Check if the old deck exists in the user's list of decks
+    if old_deck_name not in user_data['data']['decks']:
+        raise HTTPException(status_code=404, detail=f"Deck '{old_deck_name}' not found in user's list of decks.")
+
     # Update the user's list of decks
-    try:
-        users_table.update_item(
-            Key={'user_id': user_id},
-            UpdateExpression="SET decks = :new_decks",
-            ConditionExpression="contains(decks, :old_deck_name)",
-            ExpressionAttributeValues={
-                ':old_deck_name': old_deck_name,
-                ':new_decks': [new_deck_name if deck == old_deck_name else deck for deck in users_table.get_item(Key={'user_id': user_id})['Item']['decks']]
-            }
-        )
-    except Exception as e:
-        if 'ConditionalCheckFailedException' in str(e):
-            raise HTTPException(status_code=404, detail=f"Deck '{old_deck_name}' not found in user's list of decks.")
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+    updated_decks = [new_deck_name if deck == old_deck_name else deck for deck in user_data['data']['decks']]
 
     # Update the user's active deck if it matches the old deck name
-    try:
-        user_data = users_table.get_item(Key={'user_id': user_id})['Item']
-        if user_data.get('deck') == old_deck_name:
-            users_table.update_item(
-                Key={'user_id': user_id},
-                UpdateExpression="SET deck = :new_deck_name",
-                ExpressionAttributeValues={
-                    ':new_deck_name': new_deck_name
-                }
-            )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update user's active deck: {str(e)}")
+    update_data = {'decks': updated_decks}
+    if user_data['data']['deck'] == old_deck_name:
+        update_data['deck'] = new_deck_name
 
+    try:
+        update_userdata(UserData(**update_data), user_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
 
     return {"message": f"Deck '{old_deck_name}' renamed to '{new_deck_name}' successfully."}
 
@@ -569,9 +561,10 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
 
 # To add/remove fields, specify in UserData class
 # They will get picked up dynamically by the PUT and GET /user-data paths
+
 class UserData(BaseModel):
     max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=30)
-    deck: str = Field(default="default", description="Deck used for /next, /add, /list, /upload if otherwise unspecified")
+    deck: Optional[str] = Field(default="default", description="Deck used for /next, /add, /list, /upload if otherwise unspecified")
     decks: List[constr(strip_whitespace=True, min_length=1)] = Field(default=["default"], description="List of user's decks")
 
 # Setting userdata
