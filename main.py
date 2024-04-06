@@ -459,6 +459,13 @@ def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), u
 
 @app.put("/rename-deck")
 def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str = Body(..., embed=True), user_id: str = Depends(fetch_user_id)):
+    # Get the user's current data
+    user_data = get_userdata(user_id)
+
+    # Check if the new deck name is already in use
+    if new_deck_name in user_data['data']['decks']:
+        raise HTTPException(status_code=400, detail=f"Deck name '{new_deck_name}' is already in use.")
+    
     old_hashed_deck = sha256_hash(old_deck_name)
     new_hashed_deck = sha256_hash(new_deck_name)
 
@@ -481,9 +488,6 @@ def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str =
 
             # Delete the old item
             batch.delete_item(Key={'user_id': user_id, 'card_id': old_card_id})
-
-    # Get the user's current data
-    user_data = get_userdata(user_id)
 
     # Check if the old deck exists in the user's list of decks
     if old_deck_name not in user_data['data']['decks']:

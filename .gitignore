@@ -6,3 +6,5 @@ deploy.log
 run_env.sh
 .env
 .env-dev
+backup.csv
+restore-backup.py
