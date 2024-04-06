@@ -548,7 +548,7 @@ async def extract_anki2(file_path):
     return cards
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):    
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Body(...)):    
     if not file.filename.endswith('.anki2'):
         return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 file."})
 
