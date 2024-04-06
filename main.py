@@ -139,9 +139,10 @@ def validate_authentication(user_id: str = Depends(fetch_user_id)):
 
 @app.post("/add")
 def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), deck: str = Depends(get_deck), user_id: str = Depends(fetch_user_id)):
-    
-    card_id = f"{sha256_hash(deck)}-{str(uuid.uuid4())}" # Generate card_id with deck and unique identifier
-    
+    # Create deck if doesn't exist
+    create_deck(deck, user_id)
+
+    card_id = f"{sha256_hash(deck)}-{str(uuid.uuid4())}"
     # Store the flashcard details
     try:
         flashcards_table.put_item(
@@ -418,6 +419,20 @@ def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(g
         print(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while listing the flashcards.")
 
+@app.put("/create-deck/{deck}")
+def create_deck(deck: str = Path(..., title="The name of the deck to create"), user_id: str = Depends(fetch_user_id)):
+    try:
+        decks = get_userdata(user_id).get("data", {}).get("decks", [])
+        updated_decks = decks + [deck] if deck not in decks else decks
+
+        update_data = { 'decks': updated_decks }
+        update_userdata(UserData(**update_data), user_id)
+
+        return {"message": f"Deck '{deck}' created successfully."}
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while creating deck.")
+
 
 @app.delete("/delete-deck/{deck}")
 def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), user_id: str = Depends(fetch_user_id)):
@@ -533,7 +548,7 @@ async def extract_anki2(file_path):
     return cards
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):    
     if not file.filename.endswith('.anki2'):
         return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 file."})
 
@@ -543,6 +558,7 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
         shutil.copyfileobj(file.file, tmp_file)
     
     try:
+        create_deck(deck, user_id)
         extracted_cards = await extract_anki2(tmp_file_path)
 
         with flashcards_table.batch_writer() as batch:
@@ -609,7 +625,7 @@ def get_userdata(user_id: str = Depends(fetch_user_id)):
     try:
         # Return userdata, providing default values where missing
         response = users_table.get_item(Key={'user_id': user_id})
-        user_data = response.get('Item', {})  # Use get() to avoid KeyError
+        user_data = response.get('Item', {})  
 
         user_data.pop('user_id', None) # Remove redundant user_id
         merged_user_data = UserData.parse_obj(user_data)
