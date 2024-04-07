@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request, Header, Body, Depends, Path, File, UploadFile, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from datetime import datetime, timedelta, date
 from math import exp, pow
 from mangum import Mangum
@@ -19,6 +19,8 @@ from starlette.responses import RedirectResponse, HTMLResponse
 from authlib.integrations.starlette_client import OAuthError
 from typing import List, Optional
 import hashlib
+import csv
+import tempfile
 
 
 
@@ -578,6 +580,56 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch
             os.remove(tmp_file_path)
     
     return JSONResponse(content={"message": message})
+
+@app.get("/download")
+def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, mode='w', newline='', encoding='utf-8', suffix='.csv')
+    temp_file_path = temp_file.name
+    try:
+        response = list_flashcards(user_id, deck)
+        flashcards = response.get("flashcards", [])
+
+        # Derive list of columns
+        cols = set()
+        for flashcard in flashcards:
+            cols.update(flashcard.keys())
+        cols.remove('user_id')
+
+        # Write to csv
+        writer = csv.DictWriter(temp_file, fieldnames=list(cols), quoting=csv.QUOTE_NONNUMERIC)
+
+        writer.writeheader()
+        for flashcard in flashcards:
+            # Update flashcard value to preserve newline characters and identify the data type
+            sanitized_flashcards = {} 
+            for key, value in flashcard.items():
+                if key == 'user_id': # Don't include user_id
+                    continue
+                if isinstance(value, str): 
+                    # Try to convert to number
+                    try:
+                        value = float(value)
+                        if value.is_integer():
+                            value = int(value)
+                    except ValueError:  # If it fails, keep as str
+                        value = value.replace('\n', '\\n')
+                    sanitized_flashcards[key] = value
+                else: # If the value is not int, float or str, convert it to string format 
+                    sanitized_flashcards[key] = str(value)
+
+            writer.writerow(sanitized_flashcards)
+
+        return FileResponse(temp_file_path, filename=f"{deck}.csv", media_type='text/csv')
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Error while creating deck download: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
+    finally:
+        temp_file.close()
+
+
 
 # To add/remove fields, specify in UserData class
 # They will get picked up dynamically by the PUT and GET /user-data paths
