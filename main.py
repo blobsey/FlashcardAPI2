@@ -619,7 +619,7 @@ def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
 
             writer.writerow(sanitized_flashcards)
 
-        return FileResponse(temp_file_path, filename=f"{deck}.csv", media_type='text/csv')
+        return FileResponse(temp_file_path, headers={'Content-Disposition': f'attachment; filename="{deck}.csv"'}, media_type='text/csv')
 
     except HTTPException as http_exc:
         raise http_exc
