@@ -476,54 +476,59 @@ def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), u
 
 @app.put("/rename-deck")
 def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str = Body(..., embed=True), user_id: str = Depends(fetch_user_id)):
-    # Get the user's current data
-    user_data = get_userdata(user_id)
-
-    # Check if the new deck name is already in use
-    if new_deck_name in user_data['data']['decks']:
-        raise HTTPException(status_code=400, detail=f"Deck name '{new_deck_name}' is already in use.")
-    
-    old_hashed_deck = sha256_hash(old_deck_name)
-    new_hashed_deck = sha256_hash(new_deck_name)
-
-    # Scan the table to retrieve all cards for the user and the specified old deck
-    response = flashcards_table.scan(
-        FilterExpression=Attr('user_id').eq(user_id) & Attr('card_id').begins_with(f"{old_hashed_deck}-")
-    )
-    cards = response.get('Items', [])
-
-    # Batch write requests
-    with flashcards_table.batch_writer() as batch:
-        for card in cards:
-            old_card_id = card['card_id']
-            new_card_id = f"{new_hashed_deck}-" + old_card_id.split("-", 1)[1]
-
-            # Create a new item with the updated card_id
-            new_card = card.copy()
-            new_card['card_id'] = new_card_id
-            batch.put_item(Item=new_card)
-
-            # Delete the old item
-            batch.delete_item(Key={'user_id': user_id, 'card_id': old_card_id})
-
-    # Check if the old deck exists in the user's list of decks
-    if old_deck_name not in user_data['data']['decks']:
-        raise HTTPException(status_code=404, detail=f"Deck '{old_deck_name}' not found in user's list of decks.")
-
-    # Update the user's list of decks
-    updated_decks = [new_deck_name if deck == old_deck_name else deck for deck in user_data['data']['decks']]
-
-    # Update the user's active deck if it matches the old deck name
-    update_data = {'decks': updated_decks}
-    if user_data['data']['deck'] == old_deck_name:
-        update_data['deck'] = new_deck_name
-
     try:
-        update_userdata(UserData(**update_data), user_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+        # Get the user's current data
+        user_data = get_userdata(user_id)
+        
+        # Check if the old deck exists in the user's list of decks
+        if old_deck_name not in user_data['data']['decks']:
+            raise HTTPException(status_code=404, detail=f"Deck '{old_deck_name}' not found in user's list of decks.")
 
-    return {"message": f"Deck '{old_deck_name}' renamed to '{new_deck_name}' successfully."}
+        # Check if the new deck name is already in use
+        if new_deck_name in user_data['data']['decks']:
+            raise HTTPException(status_code=400, detail=f"Deck name '{new_deck_name}' is already in use.")
+        
+        old_hashed_deck = sha256_hash(old_deck_name)
+        new_hashed_deck = sha256_hash(new_deck_name)
+
+        # Update the user's list of decks
+        updated_decks = [new_deck_name if deck == old_deck_name else deck for deck in user_data['data']['decks']]
+
+        # Update the user's active deck if it matches the old deck name
+        update_data = {'decks': updated_decks}
+        if user_data['data']['deck'] == old_deck_name:
+            update_data['deck'] = new_deck_name
+
+        update_userdata(UserData(**update_data), user_id)
+
+        # Scan the table to retrieve all cards for the user and the specified old deck
+        response = flashcards_table.scan(
+            FilterExpression=Attr('user_id').eq(user_id) & Attr('card_id').begins_with(f"{old_hashed_deck}-")
+        )
+        cards = response.get('Items', [])
+
+        # Batch write requests
+        with flashcards_table.batch_writer() as batch:
+            for card in cards:
+                old_card_id = card['card_id']
+                new_card_id = f"{new_hashed_deck}-" + old_card_id.split("-", 1)[1]
+
+                # Create a new item with the updated card_id
+                new_card = card.copy()
+                new_card['card_id'] = new_card_id
+                batch.put_item(Item=new_card)
+
+                # Delete the old item
+                batch.delete_item(Key={'user_id': user_id, 'card_id': old_card_id})
+
+        return {"message": f"Deck '{old_deck_name}' renamed to '{new_deck_name}' successfully."}
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Error while creating deck download: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
+
 
 
 # Helper function for /upload path to extract cards
