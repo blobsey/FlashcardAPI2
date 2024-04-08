@@ -8,7 +8,6 @@ import uuid
 import random
 from boto3.dynamodb.conditions import Attr, Key
 from decimal import Decimal
-import shutil
 import os
 import pysqlite3 as sqlite3
 from pydantic import BaseModel, Field, constr
@@ -21,6 +20,7 @@ from typing import List, Optional
 import hashlib
 import csv
 import tempfile
+import io
 
 
 
@@ -530,9 +530,64 @@ def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str =
         raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
 
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Body(...)):    
+    try:
+        file_content = await file.read()
+        
+        if file.filename.endswith('.anki2'):
+            extracted_cards = await extract_anki2(file_content)
+        elif file.filename.endswith('.csv'):
+            extracted_cards = await extract_csv(file_content)
+        else:
+            return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 or .csv file."})
+        
+        create_deck(deck, user_id)
+
+        with flashcards_table.batch_writer() as batch:
+            for card in extracted_cards:
+                batch.put_item(Item={
+                    'user_id': user_id,
+                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",  # Generate a unique ID for each card
+                    'card_front': card['card_front'],
+                    'card_back': card['card_back'],
+                })
+
+        return {"message": f"Successfully imported {len(extracted_cards)} cards into {deck}"}
+    except Exception as e:
+        return {"message": f"An error occurred: {str(e)}"}
+    
+
+async def extract_csv(file_content):
+    cards = []
+    csvfile = io.StringIO(file_content.decode('utf-8'))  # Convert bytes to string
+    reader = csv.DictReader(csvfile)
+
+    reader = csv.DictReader(csvfile)
+    for row in reader:
+        card_front = row['card_front'].replace('\\n', '\n').replace('""', '"')
+        card_back = row['card_back'].replace('\\n', '\n').replace('""', '"')
+
+        # Convert numeric values
+        for key, value in row.items():
+            if key not in ['card_front', 'card_back'] and value:
+                try:
+                    row[key] = float(value)
+                    if row[key].is_integer():
+                        row[key] = int(row[key])
+                except ValueError:
+                    pass
+
+        cards.append({'card_front': card_front, 'card_back': card_back, **{k:v for k,v in row.items() if k not in ['card_front', 'card_back']}})
+    return cards
 
 # Helper function for /upload path to extract cards
-async def extract_anki2(file_path):
+async def extract_anki2(file_content):
+    # Create a temporary file to write the content
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.anki2') as tmp_file:
+        tmp_file.write(file_content)
+        tmp_file_path = tmp_file.name
+
     # Connect to the Anki SQLite database
     conn = sqlite3.connect(file_path)
     cards = []
@@ -554,37 +609,6 @@ async def extract_anki2(file_path):
         conn.close()
     return cards
 
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Body(...)):    
-    if not file.filename.endswith('.anki2'):
-        return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 file."})
-
-    tmp_file_path = f"/tmp/{uuid.uuid4()}.anki2" 
-    
-    with open(tmp_file_path, 'wb') as tmp_file:
-        shutil.copyfileobj(file.file, tmp_file)
-    
-    try:
-        create_deck(deck, user_id)
-        extracted_cards = await extract_anki2(tmp_file_path)
-
-        with flashcards_table.batch_writer() as batch:
-            for card in extracted_cards:
-                batch.put_item(Item={
-                    'user_id': user_id,
-                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",  # Generate a unique ID for each card
-                    'card_front': card['card_front'],
-                    'card_back': card['card_back'],
-                })
-
-        message = f"Successfully imported {len(extracted_cards)} cards."
-    except Exception as e:
-        message = f"An error occurred: {str(e)}"
-    finally:
-        if os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
-    
-    return JSONResponse(content={"message": message})
 
 @app.get("/download")
 def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
