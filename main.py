@@ -531,32 +531,34 @@ def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str =
 
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Body(...)):    
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Body(...)):
     try:
         file_content = await file.read()
-        
+
         if file.filename.endswith('.anki2'):
             extracted_cards = await extract_anki2(file_content)
         elif file.filename.endswith('.csv'):
             extracted_cards = await extract_csv(file_content)
         else:
-            return JSONResponse(status_code=400, content={"message": "This file type is not supported. Please upload an .anki2 or .csv file."})
-        
+            raise HTTPException(status_code=400, detail="Filetype not supported (Is it .anki2 or .csv)?")
+
         create_deck(deck, user_id)
 
         with flashcards_table.batch_writer() as batch:
             for card in extracted_cards:
-                batch.put_item(Item={
+                item = {
                     'user_id': user_id,
-                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",  # Generate a unique ID for each card
+                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",
                     'card_front': card['card_front'],
                     'card_back': card['card_back'],
-                })
+                    **{k: Decimal(str(v)) if isinstance(v, float) else v for k, v in card.items() if file.filename.endswith('.csv')}
+                }
+                batch.put_item(Item=item)
 
         return {"message": f"Successfully imported {len(extracted_cards)} cards into {deck}"}
     except Exception as e:
-        return {"message": f"An error occurred: {str(e)}"}
-    
+        raise HTTPException(status_code=500, detail=f"An error occurred while importing deck: {e}")
+
 
 async def extract_csv(file_content):
     cards = []
@@ -588,25 +590,25 @@ async def extract_anki2(file_content):
         tmp_file.write(file_content)
         tmp_file_path = tmp_file.name
 
-    # Connect to the Anki SQLite database
-    conn = sqlite3.connect(file_path)
-    cards = []
-    try:
-        cursor = conn.cursor()
-        query = """
-        SELECT cards.id, notes.flds
-        FROM cards
-        JOIN notes ON cards.nid = notes.id
-        """
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        for row in rows:
-            card_id, flds = row
-            fields = flds.split('\x1f')  # Fields are separated by \x1f
-            if len(fields) >= 2:  # Assumes cards have both front and back
-                cards.append({'card_front': fields[0], 'card_back': fields[1]})
-    finally:
-        conn.close()
+        # Connect to the Anki SQLite database
+        conn = sqlite3.connect(tmp_file_path)
+        cards = []
+        try:
+            cursor = conn.cursor()
+            query = """
+            SELECT cards.id, notes.flds
+            FROM cards
+            JOIN notes ON cards.nid = notes.id
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            for row in rows:
+                card_id, flds = row
+                fields = flds.split('\x1f')  # Fields are separated by \x1f
+                if len(fields) >= 2:  # Assumes cards have both front and back
+                    cards.append({'card_front': fields[0], 'card_back': fields[1]})
+        finally:
+            conn.close()
     return cards
 
 
