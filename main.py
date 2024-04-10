@@ -580,7 +580,10 @@ async def extract_csv(file_content):
                 except ValueError:
                     pass
 
-        cards.append({'card_front': card_front, 'card_back': card_back, **{k:v for k,v in row.items() if k not in ['card_front', 'card_back']}})
+        cards.append({
+            'card_front': card_front, 
+            'card_back': card_back, 
+            **{k:v for k,v in row.items() if k not in ['user_id', 'card_id', 'card_front', 'card_back']}})
     return cards
 
 # Helper function for /upload path to extract cards
@@ -624,7 +627,7 @@ def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
         cols = set()
         for flashcard in flashcards:
             cols.update(flashcard.keys())
-        cols.remove('user_id')
+        cols.discard('user_id') # Use discard() in case it's an empty list
 
         # Write to csv
         writer = csv.DictWriter(temp_file, fieldnames=list(cols), quoting=csv.QUOTE_NONNUMERIC)
@@ -655,7 +658,9 @@ def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Error while creating deck download: {e}")
+        error_message = f"Error while creating deck download: {str(e)}"
+        print(error_message)
+        print(f"Traceback: {traceback.format_exc()}")  # Print the traceback for more details
         raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
     finally:
         temp_file.close()
