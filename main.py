@@ -658,13 +658,9 @@ def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        error_message = f"Error while creating deck download: {str(e)}"
-        print(error_message)
-        print(f"Traceback: {traceback.format_exc()}")  # Print the traceback for more details
         raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
     finally:
         temp_file.close()
-
 
 
 # To add/remove fields, specify in UserData class
