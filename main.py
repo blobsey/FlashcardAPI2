@@ -140,7 +140,7 @@ def validate_authentication(user_id: str = Depends(fetch_user_id)):
 
 
 @app.post("/add")
-def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), deck: str = Depends(get_deck), user_id: str = Depends(fetch_user_id)):
+def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), deck: str = Body(...), user_id: str = Depends(fetch_user_id)):
     # Create deck if doesn't exist
     create_deck(deck, user_id)
 
