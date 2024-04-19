@@ -666,10 +666,30 @@ def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get
 # To add/remove fields, specify in UserData class
 # They will get picked up dynamically by the PUT and GET /user-data paths
 
+class BlockedSite(BaseModel):
+    url: str
+    active: bool = True
+
 class UserData(BaseModel):
-    max_new_cards: int = Field(ge=0, description="Maximum new reviews allowed per day", default=30)
-    deck: Optional[str] = Field(default="default", description="Deck used for /next, /add, /list, /upload if otherwise unspecified")
-    decks: List[constr(strip_whitespace=True, min_length=1)] = Field(default=["default"], description="List of user's decks")
+    max_new_cards: int = Field(
+        ge=0,
+        description="Maximum new reviews allowed per day",
+        default=30
+    )
+    deck: Optional[str] = Field(
+        default="default",
+        description="Deck used for /next, /add, /list, /upload if otherwise unspecified"
+    )
+    decks: List[constr(strip_whitespace=True, min_length=1)] = Field(
+        default=["default"],
+        description="List of user's decks"
+    )
+    blocked_sites: List[BlockedSite] = Field(
+        default_factory=lambda: [
+            BlockedSite(url="https://www.reddit.com", active=True)
+        ],
+        description="List of blocked sites with accompanying flag for if they are enabled"
+    )
 
 # Setting userdata
 @app.put("/user-data")
