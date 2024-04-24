@@ -122,28 +122,33 @@ def fetch_user_id(request: Request):
     
     return user_id
 
-# Returns the specified deck if provided, or the user's active deck, or throw exception
-def get_deck(deck: str = Query(None), user_id: str = Depends(fetch_user_id)):
-    fetched_deck = deck or users_table.get_item(Key={'user_id': user_id}).get('Item', {}).get('deck', None) 
-    if fetched_deck is None:
-        raise HTTPException(status_code=400, detail="No active deck found, please select one.")
-    return fetched_deck
-
-
-def sha256_hash(s):
-    return hashlib.sha256(s.encode('utf-8', errors='replace')).hexdigest()
-
 
 @app.get("/validate-authentication")
 def validate_authentication(user_id: str = Depends(fetch_user_id)):
     return {"message": "Authentication valid", "user_id": user_id}
 
 
-@app.post("/add")
-def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), deck: str = Body(...), user_id: str = Depends(fetch_user_id)):
-    # Create deck if doesn't exist
-    create_deck(deck, user_id)
+def sha256_hash(s):
+    return hashlib.sha256(s.encode('utf-8', errors='replace')).hexdigest()
 
+
+# Deck request body parameter for non-GET paths; falls back to "default" if not specified
+def deck_request_body(user_id: str = Depends(fetch_user_id), deck: Optional[str] = Body(default="default")):
+    if deck not in get_userdata(user_id)["decks"]:
+        raise HTTPException(status_code=400, detail=f"Deck '{deck}' does not exist.")
+    return deck
+
+
+# Deck query parameter for GET paths; allows None to signify 'all decks'
+def deck_query_parameter(user_id: str = Depends(fetch_user_id), deck: Optional[str] = Query(None)):
+    if deck not in get_userdata(user_id)["data"]["decks"] and deck is not None:
+        raise HTTPException(status_code=400, detail=f"Deck '{deck}' does not exist.")
+    return deck
+
+
+@app.post("/add")
+def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), 
+                  deck: str = Depends(deck_request_body), user_id: str = Depends(fetch_user_id)):
     card_id = f"{sha256_hash(deck)}-{str(uuid.uuid4())}"
     # Store the flashcard details
     try:
@@ -294,37 +299,72 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
     })
 
 
+# Helper function to get list of flashcards from DynamoDB with optional deck and filter_expression
+def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None):
+    try:
+        flashcards = []
+
+        # Construct the key condition expression
+        key_condition_expression = Key('user_id').eq(user_id)
+        if deck:
+            key_condition_expression &= Key('card_id').begins_with(f"{sha256_hash(deck)}-")
+
+        query_kwargs = {
+            "KeyConditionExpression": key_condition_expression
+        }
+
+        if filter_expression:
+            query_kwargs["FilterExpression"] = filter_expression
+
+                # Start the query and pagination loop
+        response = flashcards_table.query(**query_kwargs)
+        flashcards.extend(response.get('Items', []))
+
+        # Handle pagination
+        while 'LastEvaluatedKey' in response:
+            query_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+            response = flashcards_table.query(**query_kwargs)
+            flashcards.extend(response.get('Items', []))
+
+        return flashcards
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
+@app.get("/list")
+def list_flashcards(user_id: str = Depends(fetch_user_id), 
+                    deck: str = Depends(deck_query_parameter)):
+    try:
+        flashcards = fetch_flashcards(user_id, deck)
+
+        if flashcards:
+            return {"flashcards": flashcards}
+        else:
+            return {"message": "No flashcards found."}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
 @app.get("/next")
-def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
+def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter)):
     today = datetime.utcnow().date().strftime('%Y-%m-%d')
     
     try:
         # Fetch user's preferred max_new_cards and deck
-        prefs = users_table.get_item(Key={'user_id': user_id}).get('Item', {})
-        max_new_cards = int(prefs.get('max_new_cards', 30))  # Default to 30 if not set
+        userdata = get_userdata(user_id)
+        max_new_cards = int(userdata.get('max_new_cards', 30))  # Default to 30 if not set
         
         history = histories_table.get_item(Key={'date': today, 'user_id': user_id}).get('Item', {})
         new_reviews_today = int(history.get('new_reviews', 0))  # Default to 0 if not set
         new_cards_remaining = max(max_new_cards - new_reviews_today, 0)
 
-        # Initialize the list to hold all due cards
-        unfiltered_cards = []
+        # Want to fetch due cards (review_date before today) and new cards (cards with no review_date)
+        filter_expression = Attr('review_date').lte(today) | Attr('review_date').not_exists()
 
-        # Start the query and pagination loop
-        response = flashcards_table.query(
-            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-"),
-            FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists()
-        )
-        unfiltered_cards.extend(response.get('Items', []))
-
-        # Handle pagination if there are more items to fetch
-        while 'LastEvaluatedKey' in response:
-            response = flashcards_table.query(
-                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-"),
-                FilterExpression=Attr('review_date').lte(today) | Attr('review_date').not_exists(),
-                ExclusiveStartKey=response['LastEvaluatedKey']
-            )
-            unfiltered_cards.extend(response.get('Items', []))
+        response = fetch_flashcards(user_id, deck, filter_expression)
+        unfiltered_cards = response.get("flashcards", [])
 
         # Filter to "new cards" and "review cards", pick one randomly
         new_cards = [card for card in unfiltered_cards if 'review_date' not in card][:new_cards_remaining]
@@ -358,7 +398,7 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
         raise HTTPException(status_code=404, detail="Card not found")
 
     # Check if data is empty
-    if card_front is None and card_back is None:
+    if card_front is None or card_back is None:
         return {"message": "Did not find any specified 'card_front' or 'card_back'."}
 
     # Prepare the update expression without needing Expression Attribute Names
@@ -391,35 +431,6 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
     # Return the updated flashcard in the response
     return {"message": "Flashcard updated successfully!", "flashcard": updated_response['Item']}
 
-
-@app.get("/list")
-def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
-    try:
-        flashcards = []
-
-        # Start the query and pagination loop
-        response = flashcards_table.query(
-            KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-")
-        )
-        flashcards.extend(response.get('Items', []))
-
-        # Handle pagination if there are more items to fetch
-        while 'LastEvaluatedKey' in response:
-            response = flashcards_table.query(
-                KeyConditionExpression=Key('user_id').eq(user_id) & Key('card_id').begins_with(f"{sha256_hash(deck)}-"),
-                ExclusiveStartKey=response['LastEvaluatedKey']
-            )
-            flashcards.extend(response.get('Items', []))
-
-        if flashcards:
-            return {"flashcards": flashcards}
-        else:
-            return {"message": "No flashcards found."}
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred while listing the flashcards.")
 
 @app.put("/create-deck/{deck}")
 def create_deck(deck: str = Path(..., title="The name of the deck to create"), user_id: str = Depends(fetch_user_id)):
@@ -616,7 +627,7 @@ async def extract_anki2(file_content):
 
 
 @app.get("/download")
-def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(get_deck)):
+def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter)):
     temp_file = tempfile.NamedTemporaryFile(delete=False, mode='w', newline='', encoding='utf-8', suffix='.csv')
     temp_file_path = temp_file.name
     try:
