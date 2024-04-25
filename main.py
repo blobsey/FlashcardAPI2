@@ -133,15 +133,15 @@ def sha256_hash(s):
 
 
 # Deck request body parameter for non-GET paths; falls back to "default" if not specified
-def deck_request_body(user_id: str = Depends(fetch_user_id), deck: Optional[str] = Body(default="default")):
-    if deck not in get_userdata(user_id)["decks"]:
+def deck_request_body(user_id: str = Depends(fetch_user_id), deck: Optional[str] = Body(default=None)):
+    if deck and deck not in get_userdata(user_id)["data"]["decks"]:
         raise HTTPException(status_code=400, detail=f"Deck '{deck}' does not exist.")
-    return deck
+    return deck or "default"
 
 
 # Deck query parameter for GET paths; allows None to signify 'all decks'
 def deck_query_parameter(user_id: str = Depends(fetch_user_id), deck: Optional[str] = Query(None)):
-    if deck not in get_userdata(user_id)["data"]["decks"] and deck is not None:
+    if deck and deck not in get_userdata(user_id)["data"]["decks"]:
         raise HTTPException(status_code=400, detail=f"Deck '{deck}' does not exist.")
     return deck
 
@@ -306,7 +306,7 @@ def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None):
 
         # Construct the key condition expression
         key_condition_expression = Key('user_id').eq(user_id)
-        if deck:
+        if deck: # If deck isn't "" or None
             key_condition_expression &= Key('card_id').begins_with(f"{sha256_hash(deck)}-")
 
         query_kwargs = {
@@ -363,8 +363,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
         # Want to fetch due cards (review_date before today) and new cards (cards with no review_date)
         filter_expression = Attr('review_date').lte(today) | Attr('review_date').not_exists()
 
-        response = fetch_flashcards(user_id, deck, filter_expression)
-        unfiltered_cards = response.get("flashcards", [])
+        unfiltered_cards = fetch_flashcards(user_id, deck, filter_expression)
 
         # Filter to "new cards" and "review cards", pick one randomly
         new_cards = [card for card in unfiltered_cards if 'review_date' not in card][:new_cards_remaining]
@@ -486,8 +485,11 @@ def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), u
 
 
 @app.put("/rename-deck")
-def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str = Body(..., embed=True), user_id: str = Depends(fetch_user_id)):
+def rename_deck(old_deck_name: str = Body(...), new_deck_name: str = Body(...), user_id: str = Depends(fetch_user_id)):
     try:
+        if not old_deck_name or not new_deck_name:
+            raise HTTPException(status_code=400, detail="old_deck_name and new_deck_name must not be blank")
+
         # Get the user's current data
         user_data = get_userdata(user_id)
         
@@ -542,7 +544,7 @@ def rename_deck(old_deck_name: str = Body(..., embed=True), new_deck_name: str =
 
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Body(...)):
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_request_body)):
     try:
         file_content = await file.read()
 
@@ -688,7 +690,7 @@ class UserData(BaseModel):
         default=30
     )
     deck: Optional[str] = Field(
-        default="default",
+        default=None,
         description="Deck used for /next, /add, /list, /upload if otherwise unspecified"
     )
     decks: List[constr(strip_whitespace=True, min_length=1)] = Field(
