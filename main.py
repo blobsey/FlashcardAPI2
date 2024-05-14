@@ -474,7 +474,7 @@ def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), u
     # Update the user's data with the new list of decks
     update_data = {'decks': updated_decks}
     if user_data['data']['deck'] == deck:
-        update_data['deck'] = None
+        update_data['deck'] = ''
 
     try:
         update_userdata(UserData(**update_data), user_id)
@@ -689,8 +689,8 @@ class UserData(BaseModel):
         description="Maximum new reviews allowed per day",
         default=30
     )
-    deck: Optional[str] = Field(
-        default=None,
+    deck: str = Field(
+        default='', # Default to empty string to signify 'All Flashcards'
         description="Deck used for /next, /add, /list, /upload if otherwise unspecified"
     )
     decks: List[constr(strip_whitespace=True, min_length=1)] = Field(
