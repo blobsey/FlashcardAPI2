@@ -163,7 +163,7 @@ def add_flashcard(card_front: str = Body(...), card_back: str = Body(...),
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to add flashcard: {str(e)}")
     
-    return {"message": "Flashcard added successfully", "card_id": card_id, "user_id": user_id}
+    return {"message": "Flashcard added successfully", "card_front": card_front, "card_back": card_back}
 
 
 @app.delete("/delete/{card_id}")
