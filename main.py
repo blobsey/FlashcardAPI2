@@ -169,7 +169,7 @@ def add_flashcard(card_front: str = Body(...), card_back: str = Body(...),
 @app.delete("/delete/{card_id}")
 def delete_flashcard(card_id: str = Path(..., title="The ID of the flashcard to delete"), user_id: str = Depends(fetch_user_id)):
     # Check if the flashcard exists and belongs to the user
-    response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id})
+    response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id}, ConsistentRead=True)
     if 'Item' not in response:
         raise HTTPException(status_code=404, detail="Flashcard not found")
     if response['Item']['user_id'] != user_id:
@@ -310,7 +310,8 @@ def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None):
             key_condition_expression &= Key('card_id').begins_with(f"{sha256_hash(deck)}-")
 
         query_kwargs = {
-            "KeyConditionExpression": key_condition_expression
+            "KeyConditionExpression": key_condition_expression,
+            "ConsistentRead": True
         }
 
         if filter_expression:
@@ -356,7 +357,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
         userdata = get_userdata(user_id)
         max_new_cards = int(userdata.get('max_new_cards', 30))  # Default to 30 if not set
         
-        history = histories_table.get_item(Key={'date': today, 'user_id': user_id}).get('Item', {})
+        history = histories_table.get_item(Key={'date': today, 'user_id': user_id}, ConsistentRead=True).get('Item', {})
         new_reviews_today = int(history.get('new_reviews', 0))  # Default to 0 if not set
         new_cards_remaining = max(max_new_cards - new_reviews_today, 0)
 
@@ -392,7 +393,7 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
                    card_front: str = Body(None), card_back: str = Body(None),
                    user_id: str = Depends(fetch_user_id)):
     # Check if the flashcard exists
-    response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id})
+    response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id}, ConsistentRead=True)
     if 'Item' not in response:
         raise HTTPException(status_code=404, detail="Card not found")
 
@@ -423,7 +424,7 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
         raise HTTPException(status_code=400, detail=str(e))
 
     # Fetch the updated flashcard to return it
-    updated_response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id})
+    updated_response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id}, ConsistentRead=True)
     if 'Item' not in updated_response:
         raise HTTPException(status_code=404, detail="Failed to fetch updated flashcard")
 
@@ -448,40 +449,40 @@ def create_deck(deck: str = Path(..., title="The name of the deck to create"), u
 
 @app.delete("/delete-deck/{deck}")
 def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), user_id: str = Depends(fetch_user_id)):
-    # Scan DynamoDB to find all flashcards for the user and the specified deck
-    response = flashcards_table.scan(
-        FilterExpression=Attr('user_id').eq(user_id) & Attr('card_id').begins_with(f"{sha256_hash(deck)}-")
-    )
-
-    flashcards = response.get('Items', [])
-
-    # Delete each flashcard
-    with flashcards_table.batch_writer() as batch:
-        for card in flashcards:
-            batch.delete_item(
-                Key={
-                    'user_id': user_id,
-                    'card_id': card['card_id']
-                }
-            )
-
-    # Get the user's current data
-    user_data = get_userdata(user_id)
-
-    # Remove the deck from the user's list of decks
-    updated_decks = [d for d in user_data['data']['decks'] if d != deck]
-
-    # Update the user's data with the new list of decks
-    update_data = {'decks': updated_decks}
-    if user_data['data']['deck'] == deck:
-        update_data['deck'] = ''
-
     try:
-        update_userdata(UserData(**update_data), user_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+        flashcards = fetch_flashcards(user_id, deck=deck)  
 
-    return {"message": f"Deck '{deck}' and associated cards deleted successfully."}
+        # Delete each flashcard
+        with flashcards_table.batch_writer() as batch:
+            for card in flashcards:
+                batch.delete_item(
+                    Key={
+                        'user_id': user_id,
+                        'card_id': card['card_id']
+                    }
+                )
+
+        # Get the user's current data
+        user_data = get_userdata(user_id)
+
+        # Remove the deck from the user's list of decks
+        updated_decks = [d for d in user_data['data']['decks'] if d != deck]
+
+        # Update the user's data with the new list of decks
+        update_data = {'decks': updated_decks}
+        if user_data['data']['deck'] == deck:
+            update_data['deck'] = ''
+
+        try:
+            update_userdata(UserData(**update_data), user_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to update user data: {str(e)}")
+    
+        return {"message": f"Deck '{deck}' and associated cards deleted successfully."}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
 @app.put("/rename-deck")
@@ -514,13 +515,10 @@ def rename_deck(old_deck_name: str = Body(...), new_deck_name: str = Body(...), 
 
         update_userdata(UserData(**update_data), user_id)
 
-        # Scan the table to retrieve all cards for the user and the specified old deck
-        response = flashcards_table.scan(
-            FilterExpression=Attr('user_id').eq(user_id) & Attr('card_id').begins_with(f"{old_hashed_deck}-")
-        )
-        cards = response.get('Items', [])
+        # Fetch all cards for the user and the specified old deck name
+        cards = fetch_flashcards(user_id, deck=old_deck_name)  
 
-        # Batch write requests
+        # Need to generate new card_id (primary key) since it's based on deck name, so reinsert every card
         with flashcards_table.batch_writer() as batch:
             for card in cards:
                 old_card_id = card['card_id']
@@ -539,8 +537,8 @@ def rename_deck(old_deck_name: str = Body(...), new_deck_name: str = Body(...), 
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Error while creating deck download: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
+        print(f"Error while renaming deck: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while renaming the deck.")
 
 
 @app.post("/upload")
@@ -741,7 +739,7 @@ def update_userdata(user_data: UserData, user_id: str = Depends(fetch_user_id)):
 def get_userdata(user_id: str = Depends(fetch_user_id)):
     try:
         # Return userdata, providing default values where missing
-        response = users_table.get_item(Key={'user_id': user_id})
+        response = users_table.get_item(Key={'user_id': user_id}, ConsistentRead=True)
         user_data = response.get('Item', {})  
 
         user_data.pop('user_id', None) # Remove redundant user_id
