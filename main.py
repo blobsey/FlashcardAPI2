@@ -354,7 +354,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
     
     try:
         # Fetch user's preferred max_new_cards and deck
-        userdata = get_userdata(user_id)
+        userdata = get_userdata(user_id).get("data", {})
         max_new_cards = int(userdata.get('max_new_cards', 30))  # Default to 30 if not set
         
         history = histories_table.get_item(Key={'date': today, 'user_id': user_id}, ConsistentRead=True).get('Item', {})
