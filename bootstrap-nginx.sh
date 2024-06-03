@@ -4,7 +4,7 @@
 # - Nginx and Certbot
 # - Fetches SSL certs via Certbot
 # - Sets up Nginx on port 8000 (default Uvicorn port)
-# - Installs systemd timer to renew certbot certs
+# - Installs Systemd timer to renew certbot certs
 
 # Define the hostname and email variables with default values
 HOSTNAME="example.com" # The base API URL
