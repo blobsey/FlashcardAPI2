@@ -8,7 +8,7 @@
 
 # Define the hostname and email variables with default values
 HOSTNAME="example.com" # The base API URL
-EMAIL="your-email@example.com" # Email used for Let's Encrypt notifications
+EMAIL="email@example.com" # Email used for Let's Encrypt notifications
 
 
 # Make sure HOSTNAME and EMAIL are set to non-default values
