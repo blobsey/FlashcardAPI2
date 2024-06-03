@@ -14,9 +14,10 @@ from pydantic import BaseModel, Field, constr
 from starlette.config import Config
 from authlib.integrations.starlette_client import OAuth
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import RedirectResponse, HTMLResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response, RedirectResponse, HTMLResponse
 from authlib.integrations.starlette_client import OAuthError
-from typing import List, Optional
+from typing import List, Optional, Callable
 import hashlib
 import csv
 import tempfile
@@ -35,6 +36,16 @@ app = FastAPI()
 
 # Configure SessionMiddleware for OAuth
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+
+# Ask browser not to cache responses
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+# Add the middleware to add no-cache headers to all responses
+app.add_middleware(NoCacheMiddleware)
 
 # Initialize DynamoDB 
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
