@@ -158,15 +158,20 @@ def deck_query_parameter(user_id: str = Depends(fetch_user_id), deck: Optional[s
 
 
 @app.post("/add")
-def add_flashcard(card_front: str = Body(...), card_back: str = Body(...), 
-                  deck: str = Depends(deck_request_body), user_id: str = Depends(fetch_user_id)):
+def add_flashcard(card_type: str = Body(...), 
+                  card_front: str = Body(...), 
+                  card_back: str = Body(...), 
+                  deck: str = Depends(deck_request_body), 
+                  user_id: str = Depends(fetch_user_id),):
     card_id = f"{sha256_hash(deck)}-{str(uuid.uuid4())}"
-    # Store the flashcard details
+    if card_type not in ['basic', 'cloze']:
+        raise HTTPException(status_code=400, detail=f"card_type {card_type} not in ['basic', 'cloze']")
     try:
         flashcards_table.put_item(
             Item={
                 'card_id': card_id,
                 'user_id': user_id,
+                'card_type': card_type,
                 'card_front': card_front,
                 'card_back': card_back
             }
@@ -285,7 +290,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
                              "new_reviews = if_not_exists(new_reviews, :start) + :new_inc",
             ExpressionAttributeValues={
                 ':inc': Decimal('1'),
-                ':new_inc': Decimal('0') if 'review_date' in card else Decimal('1'), # If it s a new card, increment new_reviews
+                ':new_inc': Decimal('0') if 'review_date' in card else Decimal('1'), # If it's a new card, increment new_reviews
                 ':start': Decimal('0')
             },
             ReturnValues="UPDATED_NEW"  # Returns the new values of the updated attributes
@@ -328,7 +333,7 @@ def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None):
         if filter_expression:
             query_kwargs["FilterExpression"] = filter_expression
 
-                # Start the query and pagination loop
+        # Start the query and pagination loop
         response = flashcards_table.query(**query_kwargs)
         flashcards.extend(response.get('Items', []))
 
@@ -401,20 +406,30 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
 
 @app.put("/edit/{card_id}")
 def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to edit"),
-                   card_front: str = Body(None), card_back: str = Body(None),
+                   card_type: str = Body(None),
+                   card_front: str = Body(None), 
+                   card_back: str = Body(None),
                    user_id: str = Depends(fetch_user_id)):
+        
+    # Check if data is empty
+    if card_type not in ['basic', 'cloze']:
+        raise HTTPException(status_code=400, detail=f"card_type {card_type} not in ['basic', 'cloze']")
+    if not card_front:
+        raise HTTPException(status_code=400, detail=f"card_front '{card_front}' is invalid")
+    if not card_back:
+        raise HTTPException(status_code=400, detail=f"card_back '{card_back}' is invalid")
+
     # Check if the flashcard exists
     response = flashcards_table.get_item(Key={'user_id': user_id, 'card_id': card_id}, ConsistentRead=True)
     if 'Item' not in response:
         raise HTTPException(status_code=404, detail="Card not found")
 
-    # Check if data is empty
-    if card_front is None or card_back is None:
-        return {"message": "Did not find any specified 'card_front' or 'card_back'."}
-
     # Prepare the update expression without needing Expression Attribute Names
     update_expression = "set "
     expression_attribute_values = {}
+    if card_type is not None:
+        update_expression += "card_type = :card_type, "
+        expression_attribute_values[':card_type'] = card_type
     if card_front is not None:
         update_expression += "card_front = :card_front, "
         expression_attribute_values[':card_front'] = card_front
@@ -631,7 +646,11 @@ async def extract_anki2(file_content):
                 card_id, flds = row
                 fields = flds.split('\x1f')  # Fields are separated by \x1f
                 if len(fields) >= 2:  # Assumes cards have both front and back
-                    cards.append({'card_front': fields[0], 'card_back': fields[1]})
+                    cards.append({
+                        'card_type': 'basic', 
+                        'card_front': fields[0],
+                        'card_back': fields[1]
+                        })
         finally:
             conn.close()
     return cards
