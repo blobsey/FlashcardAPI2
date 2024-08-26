@@ -22,6 +22,8 @@ import hashlib
 import csv
 import tempfile
 import io
+import json
+import base64
 
 
 
@@ -316,13 +318,12 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
 
 # Helper function to get list of flashcards from DynamoDB with optional deck and filter_expression
-def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None):
+def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None, 
+                    limit: int = None, last_evaluated_key: dict = None):
     try:
-        flashcards = []
-
         # Construct the key condition expression
         key_condition_expression = Key('user_id').eq(user_id)
-        if deck: # If deck isn't "" or None
+        if deck:
             key_condition_expression &= Key('card_id').begins_with(f"{sha256_hash(deck)}-")
 
         query_kwargs = {
@@ -332,30 +333,80 @@ def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None):
 
         if filter_expression:
             query_kwargs["FilterExpression"] = filter_expression
+        
+        if limit and limit > 0:
+            query_kwargs["Limit"] = limit
+        
+        if last_evaluated_key:
+            query_kwargs["ExclusiveStartKey"] = last_evaluated_key
 
-        # Start the query and pagination loop
-        response = flashcards_table.query(**query_kwargs)
-        flashcards.extend(response.get('Items', []))
+        items = []
+        last_evaluated_key = None
 
-        # Handle pagination
-        while 'LastEvaluatedKey' in response:
-            query_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+        while True:
+            # Execute the query
             response = flashcards_table.query(**query_kwargs)
-            flashcards.extend(response.get('Items', []))
+            
+            items.extend(response.get('Items', []))
+            last_evaluated_key = response.get('LastEvaluatedKey')
 
-        return flashcards
+            # If limit is 0 or not set, continue querying until all items are fetched
+            if limit is None or limit == 0:
+                if last_evaluated_key:
+                    query_kwargs["ExclusiveStartKey"] = last_evaluated_key
+                else:
+                    break
+            else:
+                break
+
+        return {
+            "items": items,
+            "last_evaluated_key": last_evaluated_key
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
 @app.get("/list")
-def list_flashcards(user_id: str = Depends(fetch_user_id), 
-                    deck: str = Depends(deck_query_parameter)):
+def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter),
+                    limit: int = Query(50, ge=1, le=100), last_evaluated_key: str = Query(None)):
     try:
-        flashcards = fetch_flashcards(user_id, deck)
+        # Parse the last_evaluated_key if provided
+        last_key = None
+        if last_evaluated_key:
+            try:
+                # last_evaluated_key is base64 encoded, so decode it
+                decoded_key = base64.b64decode(last_evaluated_key.encode('utf-8')).decode('utf-8')
+                last_key = json.loads(decoded_key)
+                # Ensure the user_id in last_key matches the authenticated user_id
+                if 'user_id' in last_key and last_key['user_id'] != user_id:
+                    raise HTTPException(status_code=400, detail="Invalid last_evaluated_key")
+                # Always use the authenticated user_id
+                last_key['user_id'] = user_id
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid last_evaluated_key format")
+
+        try:
+            # Fetch flashcards with pagination
+            result = fetch_flashcards(user_id, deck, limit=limit, last_evaluated_key=last_key)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ValidationException' and 'starting key' in str(e):
+                # The last_evaluated_key is no longer valid, so we'll start from the beginning
+                result = fetch_flashcards(user_id, deck, limit=limit, last_evaluated_key=None)
+            else:
+                # If it's a different error, re-raise it
+                raise
+        flashcards = result["items"]
+        next_key = result["last_evaluated_key"]
+
+        encoded_key = base64.urlsafe_b64encode(json.dumps(next_key).encode('utf-8')).decode('utf-8') if next_key else None
 
         if flashcards:
-            return {"flashcards": flashcards}
+            response = {
+                "flashcards": flashcards,
+                "next_page": encoded_key
+            }
+            return response
         else:
             return {"message": "No flashcards found."}
     except HTTPException as http_exc:
