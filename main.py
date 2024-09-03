@@ -431,7 +431,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
         # Want to fetch due cards (review_date before today) and new cards (cards with no review_date)
         filter_expression = Attr('review_date').lte(today) | Attr('review_date').not_exists()
 
-        unfiltered_cards = fetch_flashcards(user_id, deck, filter_expression)
+        unfiltered_cards = fetch_flashcards(user_id, deck, filter_expression).get('items', [])
 
         # Filter to "new cards" and "review cards", pick one randomly
         new_cards = [card for card in unfiltered_cards if 'review_date' not in card][:new_cards_remaining]
@@ -442,6 +442,7 @@ def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
         review_cards = [card for card in unfiltered_cards if card.get('review_date') == target_date] if target_date else []
         
         combined_subset = new_cards + review_cards
+        print('combined_subset', combined_subset)
         
         if combined_subset:
             selected_card = random.choice(combined_subset)
@@ -527,7 +528,7 @@ def create_deck(deck: str = Path(..., title="The name of the deck to create"), u
 @app.delete("/delete-deck/{deck}")
 def delete_deck(deck: str = Path(..., title="The name of the deck to delete"), user_id: str = Depends(fetch_user_id)):
     try:
-        flashcards = fetch_flashcards(user_id, deck=deck)  
+        flashcards = fetch_flashcards(user_id, deck=deck).get('items', [])
 
         # Delete each flashcard
         with flashcards_table.batch_writer() as batch:
@@ -593,7 +594,7 @@ def rename_deck(old_deck_name: str = Body(...), new_deck_name: str = Body(...), 
         update_userdata(UserData(**update_data), user_id)
 
         # Fetch all cards for the user and the specified old deck name
-        cards = fetch_flashcards(user_id, deck=old_deck_name)  
+        cards = fetch_flashcards(user_id, deck=old_deck_name).get('items', [])
 
         # Need to generate new card_id (primary key) since it's based on deck name, so reinsert every card
         with flashcards_table.batch_writer() as batch:
