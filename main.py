@@ -24,8 +24,7 @@ import tempfile
 import io
 import json
 import base64
-
-
+from botocore.exceptions import ClientError
 
 # Environment variables
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID') or None
@@ -75,6 +74,23 @@ w = [0.4, 0.6, 2.4, 5.8, 4.93, 0.94, 0.86, 0.01, 1.49, 0.14, 0.94, 2.18, 0.05, 0
 FACTOR = 19/81
 R = 0.9  # Desired retention rate
 DECAY = -0.5
+
+# Pydantic model defining Flashcard schema
+class Flashcard(BaseModel):
+    card_id: str
+    user_id: str
+    card_type: str
+    card_front: str
+    card_back: str
+    difficulty: Optional[float] = None
+    stability: Optional[float] = None
+    review_date: Optional[date] = None
+    last_review_date: Optional[date] = None
+
+    class Config:
+        json_encoders = {
+            date: lambda v: v.isoformat() if v else None
+        }
 
 @app.route('/login')
 async def login(request: Request):
@@ -159,29 +175,50 @@ def deck_query_parameter(user_id: str = Depends(fetch_user_id), deck: Optional[s
     return deck
 
 
-@app.post("/add")
+@app.post("/add", response_model=dict[str, Flashcard])
 def add_flashcard(card_type: str = Body(...), 
                   card_front: str = Body(...), 
                   card_back: str = Body(...), 
                   deck: str = Depends(deck_request_body), 
-                  user_id: str = Depends(fetch_user_id),):
+                  user_id: str = Depends(fetch_user_id)):
     card_id = f"{sha256_hash(deck)}-{str(uuid.uuid4())}"
     if card_type not in ['basic', 'cloze']:
         raise HTTPException(status_code=400, detail=f"card_type {card_type} not in ['basic', 'cloze']")
     try:
-        flashcards_table.put_item(
-            Item={
-                'card_id': card_id,
-                'user_id': user_id,
-                'card_type': card_type,
-                'card_front': card_front,
-                'card_back': card_back
-            }
+        new_card = Flashcard(
+            card_id=card_id,
+            user_id=user_id,
+            card_type=card_type,
+            card_front=card_front,
+            card_back=card_back
         )
+        flashcards_table.put_item(Item=new_card.dict())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to add flashcard: {str(e)}")
     
-    return {"message": "Flashcard added successfully", "card_id": card_id, "card_front": card_front, "card_back": card_back}
+    return {"flashcard": new_card}
+
+@app.get("/get/{card_id}", response_model=dict[str, Flashcard])
+def get_flashcard(card_id: str = Path(..., title="The ID of the flashcard to retrieve"), 
+                  user_id: str = Depends(fetch_user_id)):
+    try:
+        # Attempt to fetch the flashcard
+        response = flashcards_table.get_item(
+            Key={'user_id': user_id, 'card_id': card_id},
+            ConsistentRead=True
+        )
+        
+        # Check if the flashcard exists
+        if 'Item' not in response:
+            raise HTTPException(status_code=404, detail="Flashcard not found")
+        
+        # Convert the DynamoDB item to a Flashcard model
+        flashcard = Flashcard(**response['Item'])
+        
+        # Return the flashcard
+        return {"flashcard": flashcard}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while fetching the flashcard: {str(e)}")
 
 
 @app.delete("/delete/{card_id}")
@@ -202,7 +239,7 @@ def delete_flashcard(card_id: str = Path(..., title="The ID of the flashcard to 
     return {"message": "Flashcard deleted successfully"}
 
 
-@app.post("/review/{card_id}")
+@app.post("/review/{card_id}", response_model=dict[str, Flashcard])
 async def review_flashcard(card_id: str = Path(..., title="The ID of the flashcard to review"), 
                            grade: int = Body(..., embed=True), 
                            user_id: str = Depends(fetch_user_id)):
@@ -218,8 +255,14 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
     # Can't review cards before review_date
     today = datetime.utcnow().date()
-    if 'review_date' in card and today < datetime.strptime(card['review_date'], '%Y-%m-%d').date():
-        raise HTTPException(status_code=403, detail=f"Card {card_id} is not due for review yet.") 
+    if 'review_date' in card and card['review_date']:
+        try:
+            review_date = datetime.strptime(card['review_date'], '%Y-%m-%d').date()
+            if today < review_date:
+                raise HTTPException(status_code=403, detail=f"Card {card_id} is not due for review yet.")
+        except ValueError:
+            # If the date string is invalid, log the error and continue
+            print(f"Invalid review_date format for card {card_id}: {card['review_date']}")
 
     if grade not in [1, 2, 3, 4]:
         raise ValueError("Grade must be between 1 and 4.")
@@ -231,12 +274,19 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
         return w[4] - (G - 3) * w[5]
 
     # Difficulty
-    difficulty = float(card.get('difficulty', D0(grade)))
+    difficulty = card.get('difficulty')
+    if difficulty is None:
+        difficulty = D0(grade)
+    else:
+        try:
+            difficulty = float(difficulty)
+        except ValueError:
+            print(f"Invalid difficulty value for card {card_id}: {difficulty}")
+            difficulty = D0(grade)
 
     if 'difficulty' in card: # If this is a subsequent review
         difficulty = (w[7] * D0(3) + (1 - w[7])) * (difficulty - w[6] * (grade - 3))
         difficulty = max(1, min(difficulty, 10))  # Ensure difficulty is within bounds
-
 
     # Stability
     def calculate_new_stability_on_success(D, S, G):
@@ -250,7 +300,15 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
     def calculate_new_stability_on_fail(D, S):
         return w[11] * pow(D, (-w[12])) * (pow((S + 1), w[13]) - 1) * exp(w[14] * (1 - R))
 
-    stability = float(card.get('stability', w[grade - 1]))
+    stability = card.get('stability')
+    if stability is None:
+        stability = w[grade - 1]
+    else:
+        try:
+            stability = float(stability)
+        except ValueError:
+            print(f"Invalid stability value for card {card_id}: {stability}")
+            stability = w[grade - 1]
 
     if 'stability' in card: # If this is a subsequent review
         if grade == 1: # Failure
@@ -265,7 +323,7 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
 
     # Update flashcard_data with results of review
     try:
-        table.update_item(
+        response = table.update_item(
             Key={'user_id': user_id, 'card_id': card_id},
             UpdateExpression="set difficulty = :d, stability = :s, review_date = :r, last_review_date = :l",
             ExpressionAttributeValues={
@@ -274,16 +332,16 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
                 ':r': next_review_date.strftime('%Y-%m-%d'),
                 ':l': datetime.utcnow().date().strftime('%Y-%m-%d')
             },
+            ReturnValues="ALL_NEW"
         )
+        updated_card = response['Attributes']
     except Exception as e:
-        # Handle potential errors
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
-
 
     # Update flashcard_histories
     today_str = datetime.utcnow().date().strftime('%Y-%m-%d')
     try:
-        response = histories_table.update_item(
+        histories_table.update_item(
             Key={
                 'user_id': user_id,
                 'date': today_str
@@ -292,29 +350,15 @@ async def review_flashcard(card_id: str = Path(..., title="The ID of the flashca
                              "new_reviews = if_not_exists(new_reviews, :start) + :new_inc",
             ExpressionAttributeValues={
                 ':inc': Decimal('1'),
-                ':new_inc': Decimal('0') if 'review_date' in card else Decimal('1'), # If it's a new card, increment new_reviews
+                ':new_inc': Decimal('0') if 'review_date' in card else Decimal('1'),
                 ':start': Decimal('0')
-            },
-            ReturnValues="UPDATED_NEW"  # Returns the new values of the updated attributes
+            }
         )
-        updated_values = response.get('Attributes', {})
-        new_reviews = updated_values.get('new_reviews', 0)
-        all_reviews = updated_values.get('all_reviews', 0)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update flashcard history: {str(e)}")
 
-    # Return all the review details
-    return JSONResponse(content={
-        "message": "Review updated successfully",
-        "card_id": card_id,
-        "user_id": user_id,
-        "difficulty": difficulty,
-        "stability": stability,
-        "next_review_date": next_review_date.strftime('%Y-%m-%d'),
-        "last_review_date": datetime.utcnow().date().strftime('%Y-%m-%d'),
-        "new_reviews": str(new_reviews),
-        "all_reviews": str(all_reviews)
-    })
+    # Return only the updated flashcard
+    return {"flashcard": Flashcard(**updated_card)}
 
 
 # Helper function to get list of flashcards from DynamoDB with optional deck and filter_expression
@@ -344,30 +388,43 @@ def fetch_flashcards(user_id: str, deck: str = None, filter_expression = None,
         last_evaluated_key = None
 
         while True:
-            # Execute the query
-            response = flashcards_table.query(**query_kwargs)
-            
-            items.extend(response.get('Items', []))
-            last_evaluated_key = response.get('LastEvaluatedKey')
+            try:
+                # Execute the query
+                response = flashcards_table.query(**query_kwargs)
+                
+                items.extend(response.get('Items', []))
+                last_evaluated_key = response.get('LastEvaluatedKey')
 
-            # If limit is 0 or not set, continue querying until all items are fetched
-            if limit is None or limit == 0:
-                if last_evaluated_key:
-                    query_kwargs["ExclusiveStartKey"] = last_evaluated_key
+                # If limit is 0 or not set, continue querying until all items are fetched
+                if limit is None or limit == 0:
+                    if last_evaluated_key:
+                        query_kwargs["ExclusiveStartKey"] = last_evaluated_key
+                    else:
+                        break
                 else:
                     break
-            else:
-                break
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ValidationException' and 'starting key' in str(e):
+                    # The last_evaluated_key is no longer valid
+                    raise HTTPException(status_code=400, detail="The provided last_evaluated_key is no longer valid. Please restart your query from the beginning.")
+                else:
+                    # If it's a different ClientError, raise a more specific error
+                    raise HTTPException(status_code=400, detail=f"DynamoDB error: {str(e)}")
 
         return {
             "items": items,
             "last_evaluated_key": last_evaluated_key
         }
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
+class FlashcardListResponse(BaseModel):
+    flashcards: List[Flashcard]
+    next_page: Optional[str] = None
 
-@app.get("/list")
+@app.get("/list", response_model=FlashcardListResponse)
 def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter),
                     limit: int = Query(50, ge=1, le=100), last_evaluated_key: str = Query(None)):
     try:
@@ -380,83 +437,76 @@ def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(d
                 last_key = json.loads(decoded_key)
                 # Ensure the user_id in last_key matches the authenticated user_id
                 if 'user_id' in last_key and last_key['user_id'] != user_id:
-                    raise HTTPException(status_code=400, detail="Invalid last_evaluated_key")
+                    raise HTTPException(status_code=400, detail="Invalid last_evaluated_key: user_id mismatch")
                 # Always use the authenticated user_id
                 last_key['user_id'] = user_id
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid last_evaluated_key: not valid JSON")
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid last_evaluated_key format")
 
-        try:
-            # Fetch flashcards with pagination
-            result = fetch_flashcards(user_id, deck, limit=limit, last_evaluated_key=last_key)
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'ValidationException' and 'starting key' in str(e):
-                # The last_evaluated_key is no longer valid, so we'll start from the beginning
-                result = fetch_flashcards(user_id, deck, limit=limit, last_evaluated_key=None)
-            else:
-                # If it's a different error, re-raise it
-                raise
-        flashcards = result["items"]
+        # Fetch flashcards with pagination
+        result = fetch_flashcards(user_id, deck, limit=limit, last_evaluated_key=last_key)
+
+        flashcards = [Flashcard(**item) for item in result["items"]]
         next_key = result["last_evaluated_key"]
 
         encoded_key = base64.urlsafe_b64encode(json.dumps(next_key).encode('utf-8')).decode('utf-8') if next_key else None
 
-        if flashcards:
-            response = {
-                "flashcards": flashcards,
-                "next_page": encoded_key
-            }
-            return response
-        else:
-            return {"message": "No flashcards found."}
+        return FlashcardListResponse(flashcards=flashcards, next_page=encoded_key)
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+        # Log the full error for debugging
+        print(f"Unexpected error in list_flashcards: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please try again later.")
 
+from boto3.dynamodb.conditions import Attr
+from datetime import datetime, date
 
-@app.get("/next")
+@app.get("/next", response_model=dict[str, Optional[Flashcard]])
 def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter)):
-    today = datetime.utcnow().date().strftime('%Y-%m-%d')
+    today = datetime.utcnow().date()
+    today_str = today.strftime('%Y-%m-%d')
     
     try:
         # Fetch user's preferred max_new_cards and deck
         userdata = get_userdata(user_id).get("data", {})
         max_new_cards = int(userdata.get('max_new_cards', 30))  # Default to 30 if not set
         
-        history = histories_table.get_item(Key={'date': today, 'user_id': user_id}, ConsistentRead=True).get('Item', {})
+        history = histories_table.get_item(Key={'date': today_str, 'user_id': user_id}, ConsistentRead=True).get('Item', {})
         new_reviews_today = int(history.get('new_reviews', 0))  # Default to 0 if not set
         new_cards_remaining = max(max_new_cards - new_reviews_today, 0)
 
-        # Want to fetch due cards (review_date before today) and new cards (cards with no review_date)
-        filter_expression = Attr('review_date').lte(today) | Attr('review_date').not_exists()
+        # Fetch due cards (review_date before or equal to today) and new cards (review_date is Null)
+        filter_expression = Attr('review_date').lte(today_str) | Attr('review_date').eq(None)
 
         unfiltered_cards = fetch_flashcards(user_id, deck, filter_expression).get('items', [])
 
         # Filter to "new cards" and "review cards", pick one randomly
-        new_cards = [card for card in unfiltered_cards if 'review_date' not in card][:new_cards_remaining]
+        new_cards = [card for card in unfiltered_cards if card.get('review_date') is None][:new_cards_remaining]
 
         # Find the cards with earliest review date (most overdue cards)
-        review_dates = [card['review_date'] for card in unfiltered_cards if 'review_date' in card]
-        target_date = min(review_dates) if review_dates else None
-        review_cards = [card for card in unfiltered_cards if card.get('review_date') == target_date] if target_date else []
+        review_cards = [card for card in unfiltered_cards if card.get('review_date') is not None]
+        if review_cards:
+            earliest_date = min(date.fromisoformat(card['review_date']) for card in review_cards)
+            review_cards = [card for card in review_cards if date.fromisoformat(card['review_date']) == earliest_date]
         
         combined_subset = new_cards + review_cards
-        print('combined_subset', combined_subset)
         
         if combined_subset:
             selected_card = random.choice(combined_subset)
-            return { "flashcard": selected_card }
+            return {"flashcard": Flashcard(**selected_card)}
         else:
-            return {"message": "No cards to review right now."}
+            return {"flashcard": None}
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        print(f"Unexpected error in get_next_card: {str(e)}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while fetching the next card.")
+        
 
-
-@app.put("/edit/{card_id}")
+@app.put("/edit/{card_id}", response_model=dict[str, Flashcard])
 def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to edit"),
                    card_type: str = Body(None),
                    card_front: str = Body(None), 
@@ -507,7 +557,7 @@ def edit_flashcard(card_id: str = Path(..., title="The ID of the flashcard to ed
         raise HTTPException(status_code=404, detail="Failed to fetch updated flashcard")
 
     # Return the updated flashcard in the response
-    return {"message": "Flashcard updated successfully!", "flashcard": updated_response['Item']}
+    return {"flashcard": Flashcard(**updated_response['Item'])}
 
 
 @app.put("/create-deck/{deck}")
@@ -619,36 +669,6 @@ def rename_deck(old_deck_name: str = Body(...), new_deck_name: str = Body(...), 
         raise HTTPException(status_code=500, detail="An unexpected error occurred while renaming the deck.")
 
 
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_request_body)):
-    try:
-        file_content = await file.read()
-
-        if file.filename.endswith('.anki2'):
-            extracted_cards = await extract_anki2(file_content)
-        elif file.filename.endswith('.csv'):
-            extracted_cards = await extract_csv(file_content)
-        else:
-            raise HTTPException(status_code=400, detail="Filetype not supported (Is it .anki2 or .csv)?")
-
-        create_deck(deck, user_id)
-
-        with flashcards_table.batch_writer() as batch:
-            for card in extracted_cards:
-                item = {
-                    'user_id': user_id,
-                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",
-                    'card_front': card['card_front'],
-                    'card_back': card['card_back'],
-                    **{k: Decimal(str(v)) if isinstance(v, float) else v for k, v in card.items() if file.filename.endswith('.csv')}
-                }
-                batch.put_item(Item=item)
-
-        return {"message": f"Successfully imported {len(extracted_cards)} cards into {deck}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred while importing deck: {e}")
-
-
 async def extract_csv(file_content):
     cards = []
     csvfile = io.StringIO(file_content.decode('utf-8'))  # Convert bytes to string
@@ -659,15 +679,18 @@ async def extract_csv(file_content):
         card_front = row['card_front'].replace('\\n', '\n').replace('""', '"')
         card_back = row['card_back'].replace('\\n', '\n').replace('""', '"')
 
-        # Convert numeric values
+        # Convert numeric values and handle empty strings
         for key, value in row.items():
-            if key not in ['card_front', 'card_back'] and value:
-                try:
-                    row[key] = float(value)
-                    if row[key].is_integer():
-                        row[key] = int(row[key])
-                except ValueError:
-                    pass
+            if key not in ['card_front', 'card_back']:
+                if value == '':
+                    row[key] = None  # Convert empty strings to None
+                else:
+                    try:
+                        row[key] = float(value)
+                        if row[key].is_integer():
+                            row[key] = int(row[key])
+                    except ValueError:  # If it fails, keep as str
+                        pass
 
         cards.append({
             'card_front': card_front, 
@@ -707,41 +730,71 @@ async def extract_anki2(file_content):
             conn.close()
     return cards
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_request_body)):
+    try:
+        file_content = await file.read()
+
+        if file.filename.endswith('.anki2'):
+            extracted_cards = await extract_anki2(file_content)
+        elif file.filename.endswith('.csv'):
+            extracted_cards = await extract_csv(file_content)
+        else:
+            raise HTTPException(status_code=400, detail="Filetype not supported (Is it .anki2 or .csv)?")
+
+        create_deck(deck, user_id)
+
+        with flashcards_table.batch_writer() as batch:
+            for card in extracted_cards:
+                item = {
+                    'user_id': user_id,
+                    'card_id': f"{sha256_hash(deck)}-{str(uuid.uuid4())}",
+                    'card_front': card['card_front'],
+                    'card_back': card['card_back'],
+                    **{k: Decimal(str(v)) if isinstance(v, float) else v for k, v in card.items() if k not in ['card_front', 'card_back'] and v is not None}
+                }
+                batch.put_item(Item=item)
+
+        return {"message": f"Successfully imported {len(extracted_cards)} cards into {deck}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while importing deck: {e}")
+
 
 @app.get("/download")
 def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter)):
     temp_file = tempfile.NamedTemporaryFile(delete=False, mode='w', newline='', encoding='utf-8', suffix='.csv')
     temp_file_path = temp_file.name
     try:
-        response = list_flashcards(user_id, deck)
-        flashcards = response.get("flashcards", [])
+        result = fetch_flashcards(user_id, deck)
+        flashcards = result.get("items", [])
 
-        # Derive list of columns
-        cols = set()
+        column_order = [
+            'card_id', 'card_type', 'card_front', 'card_back', 'difficulty', 'stability',
+            'review_date', 'last_review_date'
+        ]
+
+        all_cols = set()
         for flashcard in flashcards:
-            cols.update(flashcard.keys())
-        cols.discard('user_id') # Use discard() in case it's an empty list
+            all_cols.update(flashcard.keys())
+        all_cols.discard('user_id')
 
-        # Write to csv
-        writer = csv.DictWriter(temp_file, fieldnames=list(cols), quoting=csv.QUOTE_NONNUMERIC)
+        column_order.extend(sorted(all_cols - set(column_order)))
+
+        writer = csv.DictWriter(temp_file, fieldnames=column_order, quoting=csv.QUOTE_NONNUMERIC)
 
         writer.writeheader()
         for flashcard in flashcards:
-            # Update flashcard value to preserve newline characters and identify the data type
             sanitized_flashcards = {} 
             for key, value in flashcard.items():
-                if key == 'user_id': # Don't include user_id
+                if key == 'user_id':
                     continue
-                if isinstance(value, str): 
-                    # Try to convert to number
-                    try:
-                        value = float(value)
-                        if value.is_integer():
-                            value = int(value)
-                    except ValueError:  # If it fails, keep as str
-                        value = value.replace('\n', '\\n')
+                if value is None:
+                    sanitized_flashcards[key] = ''  # Use empty string for null values
+                elif isinstance(value, str): 
+                    sanitized_flashcards[key] = value.replace('\n', '\\n')
+                elif isinstance(value, (int, float)):
                     sanitized_flashcards[key] = value
-                else: # If the value is not int, float or str, convert it to string format 
+                else:
                     sanitized_flashcards[key] = str(value)
 
             writer.writerow(sanitized_flashcards)
@@ -751,10 +804,10 @@ def download_deck(user_id: str = Depends(fetch_user_id), deck: str = Depends(dec
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
+        print(f"Error in download_deck: {str(e)}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while downloading flashcards.")
     finally:
         temp_file.close()
-
 
 # To add/remove fields, specify in UserData class
 # They will get picked up dynamically by the PUT and GET /user-data paths
