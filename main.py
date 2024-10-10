@@ -461,8 +461,6 @@ def list_flashcards(user_id: str = Depends(fetch_user_id), deck: str = Depends(d
         print(f"Unexpected error in list_flashcards: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please try again later.")
 
-from boto3.dynamodb.conditions import Attr
-from datetime import datetime, date
 
 @app.get("/next", response_model=dict[str, Optional[Flashcard]])
 def get_next_card(user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_query_parameter)):
@@ -731,7 +729,7 @@ async def extract_anki2(file_content):
     return cards
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: str = Depends(deck_request_body)):
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(fetch_user_id), deck: Optional[str] = Body(default=None)):
     try:
         file_content = await file.read()
 
